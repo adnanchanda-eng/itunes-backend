@@ -4,6 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "dev": "bun --watch index.ts",
+    "start": "bun index.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
