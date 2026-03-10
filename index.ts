@@ -210,7 +210,6 @@ const server = Bun.serve({
                 return json({ message: "Share revoked" });
             }
 
-            // Get playlists shared with a user
             const sharedPlaylistsMatch = path.match(/^\/api\/playlists\/shared\/(.+)$/);
             if (sharedPlaylistsMatch && method === "GET") {
                 const clerkId = decodeURIComponent(sharedPlaylistsMatch[1]);
@@ -224,12 +223,15 @@ const server = Bun.serve({
                         createdAt: playlists.createdAt,
                         song_count: sql<number>`COUNT(${playlistSongs.id})::int`,
                         shared_by: playlistShares.sharedByClerkId,
+                        shared_by_email: users.email,
+                        shared_by_name: sql<string>`CONCAT(${users.firstName}, ' ', ${users.lastName})`,
                     })
                     .from(playlistShares)
                     .innerJoin(playlists, eq(playlistShares.playlistId, playlists.id))
                     .leftJoin(playlistSongs, eq(playlists.id, playlistSongs.playlistId))
+                    .leftJoin(users, eq(users.clerkId, playlistShares.sharedByClerkId))
                     .where(eq(playlistShares.sharedWithClerkId, clerkId))
-                    .groupBy(playlists.id, playlistShares.sharedByClerkId)
+                    .groupBy(playlists.id, playlistShares.sharedByClerkId, users.email, users.firstName, users.lastName)
                     .orderBy(sql`${playlists.createdAt} DESC`);
 
                 return json(result);
