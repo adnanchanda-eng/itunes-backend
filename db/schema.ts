@@ -1,4 +1,4 @@
-import { pgTable, serial, varchar, text, integer, timestamp, uniqueIndex, index } from "drizzle-orm/pg-core";
+import { pgTable, serial, varchar, text, integer, timestamp, uniqueIndex, index, boolean } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 
 export const users = pgTable(
@@ -54,6 +54,27 @@ export const playlistSongs = pgTable(
     ]
 );
 
+export const playlistShares = pgTable(
+    "playlist_shares",
+    {
+        id: serial("id").primaryKey(),
+        playlistId: integer("playlist_id")
+            .notNull()
+            .references(() => playlists.id, { onDelete: "cascade" }),
+        sharedWithClerkId: varchar("shared_with_clerk_id", { length: 255 })
+            .notNull()
+            .references(() => users.clerkId, { onDelete: "cascade" }),
+        sharedByClerkId: varchar("shared_by_clerk_id", { length: 255 })
+            .notNull()
+            .references(() => users.clerkId, { onDelete: "cascade" }),
+        createdAt: timestamp("created_at").defaultNow(),
+    },
+    (table) => [
+        uniqueIndex("playlist_shares_playlist_id_shared_with_unique").on(table.playlistId, table.sharedWithClerkId),
+        index("idx_playlist_shares_shared_with").on(table.sharedWithClerkId),
+    ]
+);
+
 // Relations
 export const usersRelations = relations(users, ({ many }) => ({
     playlists: many(playlists),
@@ -62,8 +83,13 @@ export const usersRelations = relations(users, ({ many }) => ({
 export const playlistsRelations = relations(playlists, ({ one, many }) => ({
     user: one(users, { fields: [playlists.clerkId], references: [users.clerkId] }),
     songs: many(playlistSongs),
+    shares: many(playlistShares),
 }));
 
 export const playlistSongsRelations = relations(playlistSongs, ({ one }) => ({
     playlist: one(playlists, { fields: [playlistSongs.playlistId], references: [playlists.id] }),
+}));
+
+export const playlistSharesRelations = relations(playlistShares, ({ one }) => ({
+    playlist: one(playlists, { fields: [playlistShares.playlistId], references: [playlists.id] }),
 }));
