@@ -1,7 +1,7 @@
 import { eq, sql, and } from "drizzle-orm";
 
 import { db } from "./db";
-import { users, playlists, playlistSongs } from "./db/schema";
+import { users, playlists, playlistSongs, playlistShares } from "./db/schema";
 
 // Convert camelCase keys to snake_case to preserve the existing API contract
 function toSnake(str: string): string {
@@ -159,6 +159,82 @@ const server = Bun.serve({
                 return json({ message: "Song removed from playlist" });
             }
 
+            // --- Playlist Sharing ---
+
+            // Share a playlist with another user (by email)
+            const shareMatch = path.match(/^\/api\/playlists\/(\d+)\/share$/);
+            if (shareMatch && method === "POST") {
+                const playlistId = parseInt(shareMatch[1]);
+                const { email, shared_by_clerk_id } = await req.json();
+                if (!email || !shared_by_clerk_id) return json({ error: "email and shared_by_clerk_id are required" }, 400);
+
+                // Verify the playlist exists and belongs to the sharer
+                const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
+                if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
+                if (playlist[0].clerkId !== shared_by_clerk_id) return json({ error: "Only the playlist owner can share" }, 403);
+
+                // Find the target user by email
+                const targetUser = await db.select().from(users).where(eq(users.email, email));
+                if (targetUser.length === 0) return json({ error: "User not found with that email" }, 404);
+                if (targetUser[0].clerkId === shared_by_clerk_id) return json({ error: "Cannot share with yourself" }, 400);
+
+                const result = await db
+                    .insert(playlistShares)
+                    .values({
+                        playlistId,
+                        sharedWithClerkId: targetUser[0].clerkId,
+                        sharedByClerkId: shared_by_clerk_id,
+                    })
+                    .returning();
+
+                return json(result[0], 201);
+            }
+
+            // Revoke a share
+            const revokeShareMatch = path.match(/^\/api\/playlists\/(\d+)\/share\/(.+)$/);
+            if (revokeShareMatch && method === "DELETE") {
+                const playlistId = parseInt(revokeShareMatch[1]);
+                const sharedWithClerkId = decodeURIComponent(revokeShareMatch[2]);
+
+                const result = await db
+                    .delete(playlistShares)
+                    .where(
+                        and(
+                            eq(playlistShares.playlistId, playlistId),
+                            eq(playlistShares.sharedWithClerkId, sharedWithClerkId)
+                        )
+                    )
+                    .returning();
+
+                if (result.length === 0) return json({ error: "Share not found" }, 404);
+                return json({ message: "Share revoked" });
+            }
+
+            // Get playlists shared with a user
+            const sharedPlaylistsMatch = path.match(/^\/api\/playlists\/shared\/(.+)$/);
+            if (sharedPlaylistsMatch && method === "GET") {
+                const clerkId = decodeURIComponent(sharedPlaylistsMatch[1]);
+
+                const result = await db
+                    .select({
+                        id: playlists.id,
+                        clerkId: playlists.clerkId,
+                        name: playlists.name,
+                        description: playlists.description,
+                        createdAt: playlists.createdAt,
+                        song_count: sql<number>`COUNT(${playlistSongs.id})::int`,
+                        shared_by: playlistShares.sharedByClerkId,
+                    })
+                    .from(playlistShares)
+                    .innerJoin(playlists, eq(playlistShares.playlistId, playlists.id))
+                    .leftJoin(playlistSongs, eq(playlists.id, playlistSongs.playlistId))
+                    .where(eq(playlistShares.sharedWithClerkId, clerkId))
+                    .groupBy(playlists.id, playlistShares.sharedByClerkId)
+                    .orderBy(sql`${playlists.createdAt} DESC`);
+
+                return json(result);
+            }
+
             // Add a song to a playlist
             const addSongMatch = path.match(/^\/api\/playlists\/(\d+)\/songs$/);
             if (addSongMatch && method === "POST") {
@@ -196,9 +272,26 @@ const server = Bun.serve({
             const playlistMatch = path.match(/^\/api\/playlists\/(\d+)$/);
             if (playlistMatch && method === "GET") {
                 const playlistId = parseInt(playlistMatch[1]);
+                const clerkId = url.searchParams.get("clerk_id");
 
                 const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
                 if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
+
+                // Check access: owner or shared-with user
+                const isOwner = playlist[0].clerkId === clerkId;
+                let isShared = false;
+                if (!isOwner && clerkId) {
+                    const shareRecord = await db
+                        .select()
+                        .from(playlistShares)
+                        .where(
+                            and(
+                                eq(playlistShares.playlistId, playlistId),
+                                eq(playlistShares.sharedWithClerkId, clerkId)
+                            )
+                        );
+                    isShared = shareRecord.length > 0;
+                }
 
                 const songs = await db
                     .select()
@@ -206,7 +299,7 @@ const server = Bun.serve({
                     .where(eq(playlistSongs.playlistId, playlistId))
                     .orderBy(playlistSongs.position);
 
-                return json({ ...playlist[0], songs });
+                return json({ ...playlist[0], songs, is_owner: isOwner, is_shared: isShared });
             }
 
             // Update a playlist
@@ -248,13 +341,16 @@ const server = Bun.serve({
             const code = err.code || err.cause?.code;
             const msg = err.message || "";
             if (code === "23505" || msg.includes("unique")) {
+                if (msg.includes("playlist_shares")) {
+                    return json({ error: "Playlist already shared with this user" }, 409);
+                }
                 return json({ error: "Song already in playlist" }, 409);
             }
             if (code === "23503" || msg.includes("foreign key") || msg.includes("violates foreign key")) {
                 return json({ error: "User not found. Please sign in again." }, 400);
             }
-            console.error("API error:", msg);
-            return json({ error: "Something went wrong" }, 500);
+            console.error("API error:", err);
+            return json({ error: "Something went wrong", details: String(err), stack: err.stack }, 500);
         }
     },
 });
