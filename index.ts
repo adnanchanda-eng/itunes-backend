@@ -813,32 +813,37 @@ const server = Bun.serve({
 
             // --- User Search History (Redis-backed) ---
 
-            // Get user's recent search history (last 5 queries)
+            // Get user's recent search history (last 5 songs)
             const searchHistoryGetMatch = path.match(/^\/api\/search-history\/(.+)$/);
             if (searchHistoryGetMatch && method === "GET") {
                 const clerkId = decodeURIComponent(searchHistoryGetMatch[1]);
-                const key = `search:history:${clerkId}`;
+                const key = `search:recent-songs:${clerkId}`;
                 try {
-                    const history = await redis.lrange(key, 0, 4);
+                    const cached = await redis.get(key);
+                    const history = cached ? JSON.parse(cached) : [];
                     return json({ searches: history });
                 } catch {
                     return json({ searches: [] });
                 }
             }
 
-            // Save a search query to user's history
+            // Save a recently played song to user's history
             if (path === "/api/search-history" && method === "POST") {
-                const { clerk_id, query } = await req.json() as { clerk_id?: string; query?: string };
-                if (!clerk_id || !query?.trim()) return json({ error: "clerk_id and query are required" }, 400);
+                const { clerk_id, song } = await req.json() as { clerk_id?: string; song?: any };
+                if (!clerk_id || !song || !song.id) return json({ error: "clerk_id and valid song object are required" }, 400);
 
-                const key = `search:history:${clerk_id}`;
-                const trimmedQuery = query.trim();
+                const key = `search:recent-songs:${clerk_id}`;
                 try {
-                    // Remove duplicate if exists, then push to front, keep only 5
-                    await redis.lrem(key, 0, trimmedQuery);
-                    await redis.lpush(key, trimmedQuery);
-                    await redis.ltrim(key, 0, 4);
-                    await redis.expire(key, CACHE_TTL_SEARCH_HISTORY);
+                    // Fetch existing, prepend new (filtering out duplicates), slice to 5, save
+                    let history = [];
+                    const cached = await redis.get(key);
+                    if (cached) {
+                        history = JSON.parse(cached);
+                    }
+                    
+                    history = [song, ...history.filter((s: any) => s.id !== song.id)].slice(0, 5);
+                    
+                    await redis.set(key, JSON.stringify(history), "EX", CACHE_TTL_SEARCH_HISTORY);
                     return json({ saved: true });
                 } catch {
                     return json({ saved: false });
