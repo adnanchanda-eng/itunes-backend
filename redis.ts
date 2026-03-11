@@ -6,12 +6,12 @@ import Redis from "ioredis";
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
+    keepAlive: 10000,
     retryStrategy(times) {
         // Retry with exponential backoff, max 3 seconds, stop after 10 retries
         if (times > 10) return null;
         return Math.min(times * 200, 3000);
     },
-    // Do NOT use lazyConnect — let ioredis manage reconnection automatically
 });
 
 redis.on("connect", () => {
