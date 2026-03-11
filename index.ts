@@ -385,6 +385,9 @@ const server = Bun.serve({
                 const playlist = await db.select().from(playlists).where(eq(playlists.id, tokenRecord[0].playlistId));
                 if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
 
+                // Fetch owner info
+                const owner = await db.select().from(users).where(eq(users.clerkId, playlist[0].clerkId));
+
                 const songs = await db
                     .select()
                     .from(playlistSongs)
@@ -398,6 +401,9 @@ const server = Bun.serve({
                     song_count: songs.length,
                     songs,
                     token,
+                    owner_name: owner.length > 0
+                        ? [owner[0].firstName, owner[0].lastName].filter(Boolean).join(" ") || owner[0].username || owner[0].email
+                        : null,
                 });
             }
 
