@@ -144,15 +144,25 @@ const server = Bun.serve({
                 return json(result);
             }
 
-            // Remove a song from a playlist
+            // Remove a song from a playlist (owner only)
             const removeSongMatch = path.match(/^\/api\/playlists\/(\d+)\/songs\/(.+)$/);
             if (removeSongMatch && method === "DELETE") {
+                const playlistId = parseInt(removeSongMatch[1]);
+                const trackId = removeSongMatch[2];
+                const clerkId = url.searchParams.get("clerk_id");
+
+                if (!clerkId) return json({ error: "clerk_id is required" }, 400);
+
+                const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
+                if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
+                if (playlist[0].clerkId !== clerkId) return json({ error: "Only the playlist owner can remove songs" }, 403);
+
                 const result = await db
                     .delete(playlistSongs)
                     .where(
                         and(
-                            eq(playlistSongs.playlistId, parseInt(removeSongMatch[1])),
-                            eq(playlistSongs.trackId, removeSongMatch[2])
+                            eq(playlistSongs.playlistId, playlistId),
+                            eq(playlistSongs.trackId, trackId)
                         )
                     )
                     .returning();
@@ -192,11 +202,18 @@ const server = Bun.serve({
                 return json(result[0], 201);
             }
 
-            // Revoke a share
+            // Revoke a share (owner only)
             const revokeShareMatch = path.match(/^\/api\/playlists\/(\d+)\/share\/(.+)$/);
             if (revokeShareMatch && method === "DELETE") {
                 const playlistId = parseInt(revokeShareMatch[1]);
                 const sharedWithClerkId = decodeURIComponent(revokeShareMatch[2]);
+                const clerkId = url.searchParams.get("clerk_id");
+
+                if (!clerkId) return json({ error: "clerk_id is required" }, 400);
+
+                const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
+                if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
+                if (playlist[0].clerkId !== clerkId) return json({ error: "Only the playlist owner can revoke shares" }, 403);
 
                 const result = await db
                     .delete(playlistShares)
@@ -239,15 +256,20 @@ const server = Bun.serve({
                 return json(result);
             }
 
-            // Add a song to a playlist
+            // Add a song to a playlist (owner only)
             const addSongMatch = path.match(/^\/api\/playlists\/(\d+)\/songs$/);
             if (addSongMatch && method === "POST") {
-                const { track_id, title, artist_name, album_art, preview_url, collection_name, duration } = await req.json();
+                const { track_id, title, artist_name, album_art, preview_url, collection_name, duration, clerk_id } = await req.json();
                 if (!track_id || !title || !artist_name) {
                     return json({ error: "track_id, title, and artist_name are required" }, 400);
                 }
+                if (!clerk_id) return json({ error: "clerk_id is required" }, 400);
 
                 const playlistId = parseInt(addSongMatch[1]);
+
+                const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
+                if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
+                if (playlist[0].clerkId !== clerk_id) return json({ error: "Only the playlist owner can add songs" }, 403);
 
                 const posResult = await db
                     .select({ nextPos: sql<number>`COALESCE(MAX(${playlistSongs.position}), 0) + 1` })
@@ -284,9 +306,13 @@ const server = Bun.serve({
                 // Check access: owner or shared-with user
                 const isOwner = playlist[0].clerkId === clerkId;
                 let isShared = false;
+                let sharedByName: string | null = null;
+                let sharedByEmail: string | null = null;
                 if (!isOwner && clerkId) {
                     const shareRecord = await db
-                        .select()
+                        .select({
+                            sharedByClerkId: playlistShares.sharedByClerkId,
+                        })
                         .from(playlistShares)
                         .where(
                             and(
@@ -294,7 +320,21 @@ const server = Bun.serve({
                                 eq(playlistShares.sharedWithClerkId, clerkId)
                             )
                         );
-                    isShared = shareRecord.length > 0;
+                    if (shareRecord.length > 0) {
+                        isShared = true;
+                        const sharer = await db
+                            .select({
+                                firstName: users.firstName,
+                                lastName: users.lastName,
+                                email: users.email,
+                            })
+                            .from(users)
+                            .where(eq(users.clerkId, shareRecord[0].sharedByClerkId));
+                        if (sharer.length > 0) {
+                            sharedByName = [sharer[0].firstName, sharer[0].lastName].filter(Boolean).join(" ") || null;
+                            sharedByEmail = sharer[0].email;
+                        }
+                    }
                 }
 
                 const songs = await db
@@ -303,13 +343,25 @@ const server = Bun.serve({
                     .where(eq(playlistSongs.playlistId, playlistId))
                     .orderBy(playlistSongs.position);
 
-                return json({ ...playlist[0], songs, is_owner: isOwner, is_shared: isShared });
+                return json({
+                    ...playlist[0],
+                    songs,
+                    is_owner: isOwner,
+                    is_shared: isShared,
+                    ...(isShared && { shared_by_name: sharedByName, shared_by_email: sharedByEmail }),
+                });
             }
 
-            // Update a playlist
+            // Update a playlist (owner only)
             if (playlistMatch && method === "PUT") {
-                const { name, description } = await req.json();
+                const { name, description, clerk_id } = await req.json();
                 const playlistId = parseInt(playlistMatch[1]);
+
+                if (!clerk_id) return json({ error: "clerk_id is required" }, 400);
+
+                const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
+                if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
+                if (playlist[0].clerkId !== clerk_id) return json({ error: "Only the playlist owner can update" }, 403);
 
                 const result = await db
                     .update(playlists)
@@ -324,9 +376,16 @@ const server = Bun.serve({
                 return json(result[0]);
             }
 
-            // Delete a playlist
+            // Delete a playlist (owner only)
             if (playlistMatch && method === "DELETE") {
                 const playlistId = parseInt(playlistMatch[1]);
+                const clerkId = url.searchParams.get("clerk_id");
+
+                if (!clerkId) return json({ error: "clerk_id is required" }, 400);
+
+                const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
+                if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
+                if (playlist[0].clerkId !== clerkId) return json({ error: "Only the playlist owner can delete" }, 403);
 
                 const result = await db
                     .delete(playlists)
