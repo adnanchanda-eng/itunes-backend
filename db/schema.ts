@@ -159,3 +159,27 @@ export const playlistClaimCopies = pgTable(
         index("idx_playlist_claim_copies_token").on(table.token),
     ]
 );
+
+// Maps Clerk invitation IDs to playlist shares so we can resolve which playlist
+// the user was invited to when they accept the invitation link
+export const emailInvitationTokens = pgTable(
+    "email_invitation_tokens",
+    {
+        id: serial("id").primaryKey(),
+        invitationId: varchar("invitation_id", { length: 255 }).unique().notNull(),
+        playlistId: integer("playlist_id")
+            .notNull()
+            .references(() => playlists.id, { onDelete: "cascade" }),
+        email: varchar("email", { length: 255 }).notNull(),
+        sharedByClerkId: varchar("shared_by_clerk_id", { length: 255 })
+            .notNull()
+            .references(() => users.clerkId, { onDelete: "cascade" }),
+        accepted: boolean("accepted").default(false),
+        createdAt: timestamp("created_at").defaultNow(),
+        expiresAt: timestamp("expires_at"),
+    },
+    (table) => [
+        index("idx_email_invitation_tokens_invitation_id").on(table.invitationId),
+        index("idx_email_invitation_tokens_email").on(table.email),
+    ]
+);

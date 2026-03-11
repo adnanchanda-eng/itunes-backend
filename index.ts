@@ -1,9 +1,13 @@
 import crypto from "crypto";
 
+import { createClerkClient } from "@clerk/backend";
 import { eq, sql, and } from "drizzle-orm";
 
 import { db } from "./db";
-import { users, playlists, playlistSongs, playlistShares, playlistShareTokens, playlistClaimCopies, pendingPlaylistShares } from "./db/schema";
+import { users, playlists, playlistSongs, playlistShares, playlistShareTokens, playlistClaimCopies, pendingPlaylistShares, emailInvitationTokens } from "./db/schema";
+
+const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY! });
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -619,6 +623,144 @@ const server = Bun.serve({
                 });
 
                 return json({ playlist_id: newPlaylist.id });
+            }
+
+            // --- Email Invitations (Clerk-powered) ---
+
+            // Send a Clerk invitation email for a playlist
+            const inviteMatch = path.match(/^\/api\/playlists\/(\d+)\/invite$/);
+            if (inviteMatch && method === "POST") {
+                const playlistId = parseInt(inviteMatch[1]);
+                const { email, shared_by_clerk_id } = await req.json() as { email?: string; shared_by_clerk_id?: string };
+                if (!email || !shared_by_clerk_id) return json({ error: "email and shared_by_clerk_id are required" }, 400);
+
+                const emailTrimmed = String(email).trim();
+                if (!EMAIL_REGEX.test(emailTrimmed)) return json({ error: "Invalid email address" }, 400);
+                const emailLower = emailTrimmed.toLowerCase();
+
+                // Verify playlist exists and belongs to sharer
+                const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
+                if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
+                if (playlist[0].clerkId !== shared_by_clerk_id) return json({ error: "Only the playlist owner can invite" }, 403);
+
+                // Don't allow self-invite
+                const sharerUser = await db.select().from(users).where(eq(users.clerkId, shared_by_clerk_id));
+                if (sharerUser.length > 0 && sharerUser[0].email?.toLowerCase() === emailLower) {
+                    return json({ error: "Cannot invite yourself" }, 400);
+                }
+
+                // Create Clerk invitation
+                const invitation = await clerkClient.invitations.createInvitation({
+                    emailAddress: emailLower,
+                    redirectUrl: `${FRONTEND_URL}/invite/accept`,
+                    publicMetadata: {
+                        playlistInvitationPlaylistId: playlistId,
+                        playlistInvitationSharedBy: shared_by_clerk_id,
+                    },
+                    ignoreExisting: true,
+                    expiresInDays: 1,
+                });
+
+                // Store the invitation mapping in our DB
+                const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+                await db.insert(emailInvitationTokens).values({
+                    invitationId: invitation.id,
+                    playlistId,
+                    email: emailLower,
+                    sharedByClerkId: shared_by_clerk_id,
+                    expiresAt,
+                });
+
+                // Also create a pending share so the playlist is shared even if
+                // the user signs up through a different path
+                const existingPending = await db
+                    .select()
+                    .from(pendingPlaylistShares)
+                    .where(
+                        and(
+                            eq(pendingPlaylistShares.playlistId, playlistId),
+                            eq(pendingPlaylistShares.email, emailLower)
+                        )
+                    );
+                if (existingPending.length === 0) {
+                    await db.insert(pendingPlaylistShares).values({
+                        playlistId,
+                        email: emailLower,
+                        sharedByClerkId: shared_by_clerk_id,
+                    }).onConflictDoNothing();
+                }
+
+                // If user already exists, also create the direct share
+                const targetUser = await db
+                    .select()
+                    .from(users)
+                    .where(sql`LOWER(${users.email}) = ${emailLower}`);
+                if (targetUser.length > 0) {
+                    await db.insert(playlistShares).values({
+                        playlistId,
+                        sharedWithClerkId: targetUser[0].clerkId,
+                        sharedByClerkId: shared_by_clerk_id,
+                    }).onConflictDoNothing();
+                }
+
+                return json({ invitation_id: invitation.id, pending: true }, 201);
+            }
+
+            // Resolve a Clerk invitation to its playlist (called by frontend after ticket auth)
+            const resolveInvMatch = path.match(/^\/api\/invitations\/resolve$/);
+            if (resolveInvMatch && method === "GET") {
+                const invitationId = url.searchParams.get("invitation_id");
+                const clerkId = url.searchParams.get("clerk_id");
+                if (!invitationId) return json({ error: "invitation_id is required" }, 400);
+
+                const record = await db
+                    .select()
+                    .from(emailInvitationTokens)
+                    .where(eq(emailInvitationTokens.invitationId, invitationId));
+
+                if (record.length === 0) return json({ error: "Invitation not found" }, 404);
+
+                const inv = record[0];
+
+                // Check expiry
+                if (inv.expiresAt && new Date(inv.expiresAt) < new Date()) {
+                    return json({ error: "Invitation has expired" }, 410);
+                }
+
+                // Mark as accepted
+                await db
+                    .update(emailInvitationTokens)
+                    .set({ accepted: true })
+                    .where(eq(emailInvitationTokens.id, inv.id));
+
+                // If we have the accepting user's clerk_id, create the share record
+                if (clerkId) {
+                    // Ensure user exists
+                    await db
+                        .insert(users)
+                        .values({ clerkId })
+                        .onConflictDoNothing({ target: users.clerkId });
+
+                    await db.insert(playlistShares).values({
+                        playlistId: inv.playlistId,
+                        sharedWithClerkId: clerkId,
+                        sharedByClerkId: inv.sharedByClerkId,
+                    }).onConflictDoNothing();
+
+                    // Clean up any pending share for this email
+                    await db.delete(pendingPlaylistShares).where(
+                        and(
+                            eq(pendingPlaylistShares.playlistId, inv.playlistId),
+                            eq(pendingPlaylistShares.email, inv.email)
+                        )
+                    );
+                }
+
+                return json({
+                    playlist_id: inv.playlistId,
+                    shared_by_clerk_id: inv.sharedByClerkId,
+                    email: inv.email,
+                });
             }
 
             // --- Root ---
