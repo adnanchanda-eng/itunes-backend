@@ -11,28 +11,19 @@ const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
         if (times > 10) return null;
         return Math.min(times * 200, 3000);
     },
-    lazyConnect: true,
+    // Do NOT use lazyConnect — let ioredis manage reconnection automatically
 });
 
-let isConnected = false;
-
 redis.on("connect", () => {
-    isConnected = true;
     console.log("[REDIS] Connected to Redis");
 });
 
 redis.on("error", (err) => {
-    isConnected = false;
     console.warn("[REDIS] Connection error:", err.message);
 });
 
 redis.on("close", () => {
-    isConnected = false;
-});
-
-// Connect eagerly (but don't block server startup)
-redis.connect().catch(() => {
-    console.warn("[REDIS] Initial connection failed — caching disabled");
+    console.log("[REDIS] Connection closed");
 });
 
 /**
@@ -40,7 +31,6 @@ redis.connect().catch(() => {
  * Returns parsed JSON or null if not found / Redis unavailable.
  */
 export async function cacheGet<T = unknown>(key: string): Promise<T | null> {
-    if (!isConnected) return null;
     try {
         const val = await redis.get(key);
         if (val === null) {
@@ -58,7 +48,6 @@ export async function cacheGet<T = unknown>(key: string): Promise<T | null> {
  * Set a cached value with a TTL in seconds.
  */
 export async function cacheSet(key: string, value: unknown, ttlSeconds: number): Promise<void> {
-    if (!isConnected) return;
     try {
         await redis.set(key, JSON.stringify(value), "EX", ttlSeconds);
     } catch {
@@ -70,7 +59,6 @@ export async function cacheSet(key: string, value: unknown, ttlSeconds: number):
  * Delete a single cache key.
  */
 export async function cacheDel(key: string): Promise<void> {
-    if (!isConnected) return;
     try {
         await redis.del(key);
     } catch {
@@ -83,7 +71,6 @@ export async function cacheDel(key: string): Promise<void> {
  * Uses SCAN to avoid blocking Redis.
  */
 export async function cacheDelPattern(pattern: string): Promise<void> {
-    if (!isConnected) return;
     try {
         let cursor = "0";
         do {
