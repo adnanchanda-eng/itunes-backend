@@ -1,7 +1,9 @@
+import crypto from "crypto";
+
 import { eq, sql, and } from "drizzle-orm";
 
 import { db } from "./db";
-import { users, playlists, playlistSongs, playlistShares } from "./db/schema";
+import { users, playlists, playlistSongs, playlistShares, playlistShareTokens } from "./db/schema";
 
 // Convert camelCase keys to snake_case to preserve the existing API contract
 function toSnake(str: string): string {
@@ -333,6 +335,112 @@ const server = Bun.serve({
 
                 if (result.length === 0) return json({ error: "Playlist not found" }, 404);
                 return json({ message: "Playlist deleted" });
+            }
+
+            // --- Share Links (token-based) ---
+
+            // Create a share link token for a playlist (owner only)
+            const createShareLinkMatch = path.match(/^\/api\/playlists\/(\d+)\/share-link$/);
+            if (createShareLinkMatch && method === "POST") {
+                const playlistId = parseInt(createShareLinkMatch[1]);
+                const { clerk_id } = await req.json();
+                if (!clerk_id) return json({ error: "clerk_id is required" }, 400);
+
+                // Verify playlist exists and belongs to caller
+                const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
+                if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
+                if (playlist[0].clerkId !== clerk_id) return json({ error: "Only the playlist owner can create share links" }, 403);
+
+                const token = crypto.randomBytes(16).toString("hex");
+
+                const result = await db
+                    .insert(playlistShareTokens)
+                    .values({
+                        token,
+                        playlistId,
+                        createdByClerkId: clerk_id,
+                    })
+                    .returning();
+
+                return json({ token: result[0].token, url: `/s/${result[0].token}` }, 201);
+            }
+
+            // Get playlist by share token (public, no auth required)
+            const sharedByTokenMatch = path.match(/^\/api\/playlists\/shared-by-token\/([a-f0-9]+)$/);
+            if (sharedByTokenMatch && method === "GET") {
+                const token = sharedByTokenMatch[1];
+
+                const tokenRecord = await db
+                    .select()
+                    .from(playlistShareTokens)
+                    .where(eq(playlistShareTokens.token, token));
+
+                if (tokenRecord.length === 0) return json({ error: "Invalid or expired share link" }, 404);
+
+                // Check expiry
+                if (tokenRecord[0].expiresAt && new Date(tokenRecord[0].expiresAt) < new Date()) {
+                    return json({ error: "Invalid or expired share link" }, 404);
+                }
+
+                const playlist = await db.select().from(playlists).where(eq(playlists.id, tokenRecord[0].playlistId));
+                if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
+
+                const songs = await db
+                    .select()
+                    .from(playlistSongs)
+                    .where(eq(playlistSongs.playlistId, playlist[0].id))
+                    .orderBy(playlistSongs.position);
+
+                return json({
+                    id: playlist[0].id,
+                    name: playlist[0].name,
+                    description: playlist[0].description,
+                    song_count: songs.length,
+                    songs,
+                    token,
+                });
+            }
+
+            // Claim a playlist via share token (authenticated)
+            const claimByTokenMatch = path.match(/^\/api\/playlists\/claim-by-token\/([a-f0-9]+)$/);
+            if (claimByTokenMatch && method === "POST") {
+                const token = claimByTokenMatch[1];
+                const { clerk_id } = await req.json();
+                if (!clerk_id) return json({ error: "clerk_id is required" }, 400);
+
+                const tokenRecord = await db
+                    .select()
+                    .from(playlistShareTokens)
+                    .where(eq(playlistShareTokens.token, token));
+
+                if (tokenRecord.length === 0) return json({ error: "Invalid or expired share link" }, 404);
+
+                if (tokenRecord[0].expiresAt && new Date(tokenRecord[0].expiresAt) < new Date()) {
+                    return json({ error: "Invalid or expired share link" }, 404);
+                }
+
+                // Don't let owner claim their own playlist
+                if (tokenRecord[0].createdByClerkId === clerk_id) {
+                    return json({ playlist_id: tokenRecord[0].playlistId });
+                }
+
+                // Ensure the claiming user exists
+                await db
+                    .insert(users)
+                    .values({ clerkId: clerk_id })
+                    .onConflictDoNothing({ target: users.clerkId });
+
+                // Create a share record (idempotent)
+                await db
+                    .insert(playlistShares)
+                    .values({
+                        playlistId: tokenRecord[0].playlistId,
+                        sharedWithClerkId: clerk_id,
+                        sharedByClerkId: tokenRecord[0].createdByClerkId,
+                    })
+                    .onConflictDoNothing();
+
+                return json({ playlist_id: tokenRecord[0].playlistId });
             }
 
             // --- Root ---

@@ -93,3 +93,27 @@ export const playlistSongsRelations = relations(playlistSongs, ({ one }) => ({
 export const playlistSharesRelations = relations(playlistShares, ({ one }) => ({
     playlist: one(playlists, { fields: [playlistShares.playlistId], references: [playlists.id] }),
 }));
+
+export const playlistShareTokens = pgTable(
+    "playlist_share_tokens",
+    {
+        id: serial("id").primaryKey(),
+        token: varchar("token", { length: 64 }).unique().notNull(),
+        playlistId: integer("playlist_id")
+            .notNull()
+            .references(() => playlists.id, { onDelete: "cascade" }),
+        createdByClerkId: varchar("created_by_clerk_id", { length: 255 })
+            .notNull()
+            .references(() => users.clerkId, { onDelete: "cascade" }),
+        expiresAt: timestamp("expires_at"),
+        createdAt: timestamp("created_at").defaultNow(),
+    },
+    (table) => [
+        index("idx_share_tokens_token").on(table.token),
+        index("idx_share_tokens_playlist_id").on(table.playlistId),
+    ]
+);
+
+export const playlistShareTokensRelations = relations(playlistShareTokens, ({ one }) => ({
+    playlist: one(playlists, { fields: [playlistShareTokens.playlistId], references: [playlists.id] }),
+}));
