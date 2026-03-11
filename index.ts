@@ -821,7 +821,17 @@ const server = Bun.serve({
                 try {
                     const cached = await redis.get(key);
                     const history = cached ? JSON.parse(cached) : [];
-                    return json({ searches: history });
+                    // Return raw JSON — songs are stored in camelCase from the frontend
+                    // Don't use json() helper which converts to snake_case
+                    return new Response(JSON.stringify({ searches: history }), {
+                        status: 200,
+                        headers: {
+                            "Content-Type": "application/json",
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                            "Access-Control-Allow-Headers": "Content-Type",
+                        },
+                    });
                 } catch {
                     return json({ searches: [] });
                 }
