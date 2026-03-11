@@ -3,7 +3,7 @@ import crypto from "crypto";
 import { eq, sql, and } from "drizzle-orm";
 
 import { db } from "./db";
-import { users, playlists, playlistSongs, playlistShares, playlistShareTokens } from "./db/schema";
+import { users, playlists, playlistSongs, playlistShares, playlistShareTokens, playlistClaimCopies } from "./db/schema";
 
 // Convert camelCase keys to snake_case to preserve the existing API contract
 function toSnake(str: string): string {
@@ -466,7 +466,7 @@ const server = Bun.serve({
                 });
             }
 
-            // Claim a playlist via share token (authenticated)
+            // Claim a playlist via share token (authenticated) — creates a COPY owned by claimant for full ownership
             const claimByTokenMatch = path.match(/^\/api\/playlists\/claim-by-token\/([a-f0-9]+)$/);
             if (claimByTokenMatch && method === "POST") {
                 const token = claimByTokenMatch[1];
@@ -484,9 +484,23 @@ const server = Bun.serve({
                     return json({ error: "Invalid or expired share link" }, 404);
                 }
 
-                // Don't let owner claim their own playlist
+                // Don't let owner claim their own playlist — they already have it
                 if (tokenRecord[0].createdByClerkId === clerk_id) {
                     return json({ playlist_id: tokenRecord[0].playlistId });
+                }
+
+                // Check if already claimed (idempotent)
+                const existing = await db
+                    .select()
+                    .from(playlistClaimCopies)
+                    .where(
+                        and(
+                            eq(playlistClaimCopies.token, token),
+                            eq(playlistClaimCopies.claimedByClerkId, clerk_id)
+                        )
+                    );
+                if (existing.length > 0) {
+                    return json({ playlist_id: existing[0].newPlaylistId });
                 }
 
                 // Ensure the claiming user exists
@@ -495,17 +509,48 @@ const server = Bun.serve({
                     .values({ clerkId: clerk_id })
                     .onConflictDoNothing({ target: users.clerkId });
 
-                // Create a share record (idempotent)
-                await db
-                    .insert(playlistShares)
-                    .values({
-                        playlistId: tokenRecord[0].playlistId,
-                        sharedWithClerkId: clerk_id,
-                        sharedByClerkId: tokenRecord[0].createdByClerkId,
-                    })
-                    .onConflictDoNothing();
+                // Create a COPY of the playlist owned by the claimant
+                const sourcePlaylist = await db.select().from(playlists).where(eq(playlists.id, tokenRecord[0].playlistId));
+                if (sourcePlaylist.length === 0) return json({ error: "Playlist not found" }, 404);
 
-                return json({ playlist_id: tokenRecord[0].playlistId });
+                const [newPlaylist] = await db
+                    .insert(playlists)
+                    .values({
+                        clerkId: clerk_id,
+                        name: sourcePlaylist[0].name,
+                        description: sourcePlaylist[0].description,
+                    })
+                    .returning();
+
+                const sourceSongs = await db
+                    .select()
+                    .from(playlistSongs)
+                    .where(eq(playlistSongs.playlistId, tokenRecord[0].playlistId))
+                    .orderBy(playlistSongs.position);
+
+                if (sourceSongs.length > 0) {
+                    await db.insert(playlistSongs).values(
+                        sourceSongs.map((s, i) => ({
+                            playlistId: newPlaylist.id,
+                            trackId: s.trackId,
+                            title: s.title,
+                            artistName: s.artistName,
+                            albumArt: s.albumArt,
+                            previewUrl: s.previewUrl,
+                            collectionName: s.collectionName,
+                            duration: s.duration,
+                            position: i + 1,
+                        }))
+                    );
+                }
+
+                await db.insert(playlistClaimCopies).values({
+                    token,
+                    claimedByClerkId: clerk_id,
+                    newPlaylistId: newPlaylist.id,
+                });
+
+                return json({ playlist_id: newPlaylist.id });
             }
 
             // --- Root ---

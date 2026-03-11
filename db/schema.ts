@@ -117,3 +117,25 @@ export const playlistShareTokens = pgTable(
 export const playlistShareTokensRelations = relations(playlistShareTokens, ({ one }) => ({
     playlist: one(playlists, { fields: [playlistShareTokens.playlistId], references: [playlists.id] }),
 }));
+
+// Tracks playlist copies created when a user claims via share token (copy-on-claim for full ownership)
+export const playlistClaimCopies = pgTable(
+    "playlist_claim_copies",
+    {
+        id: serial("id").primaryKey(),
+        token: varchar("token", { length: 64 })
+            .notNull()
+            .references(() => playlistShareTokens.token, { onDelete: "cascade" }),
+        claimedByClerkId: varchar("claimed_by_clerk_id", { length: 255 })
+            .notNull()
+            .references(() => users.clerkId, { onDelete: "cascade" }),
+        newPlaylistId: integer("new_playlist_id")
+            .notNull()
+            .references(() => playlists.id, { onDelete: "cascade" }),
+        createdAt: timestamp("created_at").defaultNow(),
+    },
+    (table) => [
+        uniqueIndex("playlist_claim_copies_token_claimed_unique").on(table.token, table.claimedByClerkId),
+        index("idx_playlist_claim_copies_token").on(table.token),
+    ]
+);
