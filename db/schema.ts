@@ -119,6 +119,26 @@ export const playlistShareTokensRelations = relations(playlistShareTokens, ({ on
 }));
 
 // Tracks playlist copies created when a user claims via share token (copy-on-claim for full ownership)
+// Pending shares for users not yet in DB; migrated to playlist_shares when they sign up
+export const pendingPlaylistShares = pgTable(
+    "pending_playlist_shares",
+    {
+        id: serial("id").primaryKey(),
+        playlistId: integer("playlist_id")
+            .notNull()
+            .references(() => playlists.id, { onDelete: "cascade" }),
+        email: varchar("email", { length: 255 }).notNull(),
+        sharedByClerkId: varchar("shared_by_clerk_id", { length: 255 })
+            .notNull()
+            .references(() => users.clerkId, { onDelete: "cascade" }),
+        createdAt: timestamp("created_at").defaultNow(),
+    },
+    (table) => [
+        uniqueIndex("pending_playlist_shares_playlist_email_unique").on(table.playlistId, table.email),
+        index("idx_pending_playlist_shares_email").on(table.email),
+    ]
+);
+
 export const playlistClaimCopies = pgTable(
     "playlist_claim_copies",
     {

@@ -3,7 +3,9 @@ import crypto from "crypto";
 import { eq, sql, and } from "drizzle-orm";
 
 import { db } from "./db";
-import { users, playlists, playlistSongs, playlistShares, playlistShareTokens, playlistClaimCopies } from "./db/schema";
+import { users, playlists, playlistSongs, playlistShares, playlistShareTokens, playlistClaimCopies, pendingPlaylistShares } from "./db/schema";
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // Convert camelCase keys to snake_case to preserve the existing API contract
 function toSnake(str: string): string {
@@ -83,6 +85,28 @@ const server = Bun.serve({
                         },
                     })
                     .returning();
+
+                // Migrate pending playlist shares for this user's email (case-insensitive)
+                if (email && typeof email === "string") {
+                    const emailLower = email.trim().toLowerCase();
+                    const pending = await db
+                        .select()
+                        .from(pendingPlaylistShares)
+                        .where(sql`LOWER(${pendingPlaylistShares.email}) = ${emailLower}`);
+
+                    for (const p of pending) {
+                        try {
+                            await db.insert(playlistShares).values({
+                                playlistId: p.playlistId,
+                                sharedWithClerkId: clerk_id,
+                                sharedByClerkId: p.sharedByClerkId,
+                            });
+                        } catch {
+                            // Ignore duplicate (already shared)
+                        }
+                        await db.delete(pendingPlaylistShares).where(eq(pendingPlaylistShares.id, p.id));
+                    }
+                }
 
                 return json(result[0]);
             }
@@ -180,26 +204,69 @@ const server = Bun.serve({
                 const { email, shared_by_clerk_id } = await req.json();
                 if (!email || !shared_by_clerk_id) return json({ error: "email and shared_by_clerk_id are required" }, 400);
 
+                const emailTrimmed = String(email).trim();
+                if (!EMAIL_REGEX.test(emailTrimmed)) return json({ error: "Invalid email address" }, 400);
+
+                const emailLower = emailTrimmed.toLowerCase();
+
                 // Verify the playlist exists and belongs to the sharer
                 const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
                 if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
                 if (playlist[0].clerkId !== shared_by_clerk_id) return json({ error: "Only the playlist owner can share" }, 403);
 
-                // Find the target user by email
-                const targetUser = await db.select().from(users).where(eq(users.email, email));
-                if (targetUser.length === 0) return json({ error: "User not found with that email" }, 404);
-                if (targetUser[0].clerkId === shared_by_clerk_id) return json({ error: "Cannot share with yourself" }, 400);
+                // Find the target user by email (case-insensitive)
+                const targetUser = await db
+                    .select()
+                    .from(users)
+                    .where(sql`LOWER(${users.email}) = ${emailLower}`);
 
-                const result = await db
-                    .insert(playlistShares)
+                if (targetUser.length > 0) {
+                    if (targetUser[0].clerkId === shared_by_clerk_id) return json({ error: "Cannot share with yourself" }, 400);
+
+                    // User exists: create share (idempotent - ignore duplicate)
+                    const existing = await db
+                        .select()
+                        .from(playlistShares)
+                        .where(
+                            and(
+                                eq(playlistShares.playlistId, playlistId),
+                                eq(playlistShares.sharedWithClerkId, targetUser[0].clerkId)
+                            )
+                        );
+                    if (existing.length > 0) return json(existing[0], 200);
+
+                    const result = await db
+                        .insert(playlistShares)
+                        .values({
+                            playlistId,
+                            sharedWithClerkId: targetUser[0].clerkId,
+                            sharedByClerkId: shared_by_clerk_id,
+                        })
+                        .returning();
+                    return json(result[0], 201);
+                }
+
+                // User not in DB: store as pending (they'll get it when they sign up)
+                const existingPending = await db
+                    .select()
+                    .from(pendingPlaylistShares)
+                    .where(
+                        and(
+                            eq(pendingPlaylistShares.playlistId, playlistId),
+                            eq(pendingPlaylistShares.email, emailLower)
+                        )
+                    );
+                if (existingPending.length > 0) return json({ id: existingPending[0].id, pending: true }, 200);
+
+                const pendingResult = await db
+                    .insert(pendingPlaylistShares)
                     .values({
                         playlistId,
-                        sharedWithClerkId: targetUser[0].clerkId,
+                        email: emailLower,
                         sharedByClerkId: shared_by_clerk_id,
                     })
                     .returning();
-
-                return json(result[0], 201);
+                return json({ id: pendingResult[0].id, pending: true }, 201);
             }
 
             // Revoke a share (owner only)
@@ -424,15 +491,15 @@ const server = Bun.serve({
                 return json({ token: result[0].token, url: `/s/${result[0].token}` }, 201);
             }
 
-            // Get playlist by share token (public, no auth required)
-            const sharedByTokenMatch = path.match(/^\/api\/playlists\/shared-by-token\/([a-f0-9]+)$/);
+            // Get playlist by share token (public, no auth required) — token is case-insensitive
+            const sharedByTokenMatch = path.match(/^\/api\/playlists\/shared-by-token\/([a-fA-F0-9]+)$/);
             if (sharedByTokenMatch && method === "GET") {
                 const token = sharedByTokenMatch[1];
 
                 const tokenRecord = await db
                     .select()
                     .from(playlistShareTokens)
-                    .where(eq(playlistShareTokens.token, token));
+                    .where(sql`LOWER(${playlistShareTokens.token}) = LOWER(${token})`);
 
                 if (tokenRecord.length === 0) return json({ error: "Invalid or expired share link" }, 404);
 
@@ -467,7 +534,7 @@ const server = Bun.serve({
             }
 
             // Claim a playlist via share token (authenticated) — creates a COPY owned by claimant for full ownership
-            const claimByTokenMatch = path.match(/^\/api\/playlists\/claim-by-token\/([a-f0-9]+)$/);
+            const claimByTokenMatch = path.match(/^\/api\/playlists\/claim-by-token\/([a-fA-F0-9]+)$/);
             if (claimByTokenMatch && method === "POST") {
                 const token = claimByTokenMatch[1];
                 const { clerk_id } = await req.json();
@@ -476,7 +543,7 @@ const server = Bun.serve({
                 const tokenRecord = await db
                     .select()
                     .from(playlistShareTokens)
-                    .where(eq(playlistShareTokens.token, token));
+                    .where(sql`LOWER(${playlistShareTokens.token}) = LOWER(${token})`);
 
                 if (tokenRecord.length === 0) return json({ error: "Invalid or expired share link" }, 404);
 
@@ -489,13 +556,14 @@ const server = Bun.serve({
                     return json({ playlist_id: tokenRecord[0].playlistId });
                 }
 
-                // Check if already claimed (idempotent)
+                // Check if already claimed (idempotent) — use actual token from DB for FK
+                const dbToken = tokenRecord[0].token;
                 const existing = await db
                     .select()
                     .from(playlistClaimCopies)
                     .where(
                         and(
-                            eq(playlistClaimCopies.token, token),
+                            eq(playlistClaimCopies.token, dbToken),
                             eq(playlistClaimCopies.claimedByClerkId, clerk_id)
                         )
                     );
@@ -545,7 +613,7 @@ const server = Bun.serve({
                 }
 
                 await db.insert(playlistClaimCopies).values({
-                    token,
+                    token: dbToken,
                     claimedByClerkId: clerk_id,
                     newPlaylistId: newPlaylist.id,
                 });
