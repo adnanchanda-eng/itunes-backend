@@ -4,10 +4,11 @@ import Redis from "ioredis";
 // All cache operations are wrapped in try/catch so Redis failures
 // never break the application (graceful fallback to DB)
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
-    maxRetriesPerRequest: 1,
+    maxRetriesPerRequest: null,
+    enableReadyCheck: false,
     retryStrategy(times) {
-        // Retry with exponential backoff, max 3 seconds, stop after 5 retries
-        if (times > 5) return null;
+        // Retry with exponential backoff, max 3 seconds, stop after 10 retries
+        if (times > 10) return null;
         return Math.min(times * 200, 3000);
     },
     lazyConnect: true,
