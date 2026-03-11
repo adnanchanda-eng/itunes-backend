@@ -5,9 +5,14 @@ import { eq, sql, and } from "drizzle-orm";
 
 import { db } from "./db";
 import { users, playlists, playlistSongs, playlistShares, playlistShareTokens, playlistClaimCopies, pendingPlaylistShares, emailInvitationTokens } from "./db/schema";
+import { cacheGet, cacheSet, cacheDel, cacheDelPattern, redis } from "./redis";
 
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY! });
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+
+// Cache TTL constants (seconds)
+const CACHE_TTL_PLAYLISTS = 300;   // 5 minutes
+const CACHE_TTL_SEARCH_HISTORY = 604800; // 7 days
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -146,6 +151,9 @@ const server = Bun.serve({
                     })
                     .returning();
 
+                // Invalidate user playlists cache
+                await cacheDel(`playlists:user:${clerk_id}`);
+
                 return json(result[0], 201);
             }
 
@@ -153,6 +161,11 @@ const server = Bun.serve({
             const userPlaylistsMatch = path.match(/^\/api\/playlists\/user\/(.+)$/);
             if (userPlaylistsMatch && method === "GET") {
                 const userId = decodeURIComponent(userPlaylistsMatch[1]);
+                const cacheKey = `playlists:user:${userId}`;
+
+                // Check cache first
+                const cached = await cacheGet(cacheKey);
+                if (cached) return json(cached);
 
                 const result = await db
                     .select({
@@ -169,6 +182,7 @@ const server = Bun.serve({
                     .groupBy(playlists.id)
                     .orderBy(sql`${playlists.createdAt} DESC`);
 
+                await cacheSet(cacheKey, result, CACHE_TTL_PLAYLISTS);
                 return json(result);
             }
 
@@ -196,6 +210,10 @@ const server = Bun.serve({
                     .returning();
 
                 if (result.length === 0) return json({ error: "Song not found in playlist" }, 404);
+
+                // Invalidate playlist detail cache
+                await cacheDelPattern(`playlist:${playlistId}:*`);
+
                 return json({ message: "Song removed from playlist" });
             }
 
@@ -238,6 +256,9 @@ const server = Bun.serve({
                             )
                         );
                     if (existing.length > 0) return json(existing[0], 200);
+
+                    // Invalidate shared playlists cache for the target user
+                    await cacheDel(`playlists:shared:${targetUser[0].clerkId}`);
 
                     const result = await db
                         .insert(playlistShares)
@@ -303,6 +324,11 @@ const server = Bun.serve({
             const sharedPlaylistsMatch = path.match(/^\/api\/playlists\/shared\/(.+)$/);
             if (sharedPlaylistsMatch && method === "GET") {
                 const clerkId = decodeURIComponent(sharedPlaylistsMatch[1]);
+                const cacheKey = `playlists:shared:${clerkId}`;
+
+                // Check cache first
+                const cached = await cacheGet(cacheKey);
+                if (cached) return json(cached);
 
                 const result = await db
                     .select({
@@ -324,6 +350,7 @@ const server = Bun.serve({
                     .groupBy(playlists.id, playlistShares.sharedByClerkId, users.email, users.firstName, users.lastName)
                     .orderBy(sql`${playlists.createdAt} DESC`);
 
+                await cacheSet(cacheKey, result, CACHE_TTL_PLAYLISTS);
                 return json(result);
             }
 
@@ -362,6 +389,9 @@ const server = Bun.serve({
                     })
                     .returning();
 
+                // Invalidate playlist detail cache after adding song
+                await cacheDelPattern(`playlist:${playlistId}:*`);
+
                 return json(result[0], 201);
             }
 
@@ -370,6 +400,11 @@ const server = Bun.serve({
             if (playlistMatch && method === "GET") {
                 const playlistId = parseInt(playlistMatch[1]);
                 const clerkId = url.searchParams.get("clerk_id");
+                const cacheKey = `playlist:${playlistId}:${clerkId || "anon"}`;
+
+                // Check cache first
+                const cached = await cacheGet(cacheKey);
+                if (cached) return json(cached);
 
                 const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
                 if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
@@ -414,13 +449,16 @@ const server = Bun.serve({
                     .where(eq(playlistSongs.playlistId, playlistId))
                     .orderBy(playlistSongs.position);
 
-                return json({
+                const responseData = {
                     ...playlist[0],
                     songs,
                     is_owner: isOwner,
                     is_shared: isShared,
                     ...(isShared && { shared_by_name: sharedByName, shared_by_email: sharedByEmail }),
-                });
+                };
+
+                await cacheSet(cacheKey, responseData, CACHE_TTL_PLAYLISTS);
+                return json(responseData);
             }
 
             // Update a playlist (owner only)
@@ -444,6 +482,11 @@ const server = Bun.serve({
                     .returning();
 
                 if (result.length === 0) return json({ error: "Playlist not found" }, 404);
+
+                // Invalidate playlist caches after update
+                await cacheDelPattern(`playlist:${playlistId}:*`);
+                await cacheDel(`playlists:user:${clerk_id}`);
+
                 return json(result[0]);
             }
 
@@ -464,6 +507,11 @@ const server = Bun.serve({
                     .returning();
 
                 if (result.length === 0) return json({ error: "Playlist not found" }, 404);
+
+                // Invalidate playlist caches after delete
+                await cacheDelPattern(`playlist:${playlistId}:*`);
+                await cacheDel(`playlists:user:${clerkId}`);
+
                 return json({ message: "Playlist deleted" });
             }
 
@@ -761,6 +809,40 @@ const server = Bun.serve({
                     shared_by_clerk_id: inv.sharedByClerkId,
                     email: inv.email,
                 });
+            }
+
+            // --- User Search History (Redis-backed) ---
+
+            // Get user's recent search history (last 5 queries)
+            const searchHistoryGetMatch = path.match(/^\/api\/search-history\/(.+)$/);
+            if (searchHistoryGetMatch && method === "GET") {
+                const clerkId = decodeURIComponent(searchHistoryGetMatch[1]);
+                const key = `search:history:${clerkId}`;
+                try {
+                    const history = await redis.lrange(key, 0, 4);
+                    return json({ searches: history });
+                } catch {
+                    return json({ searches: [] });
+                }
+            }
+
+            // Save a search query to user's history
+            if (path === "/api/search-history" && method === "POST") {
+                const { clerk_id, query } = await req.json() as { clerk_id?: string; query?: string };
+                if (!clerk_id || !query?.trim()) return json({ error: "clerk_id and query are required" }, 400);
+
+                const key = `search:history:${clerk_id}`;
+                const trimmedQuery = query.trim();
+                try {
+                    // Remove duplicate if exists, then push to front, keep only 5
+                    await redis.lrem(key, 0, trimmedQuery);
+                    await redis.lpush(key, trimmedQuery);
+                    await redis.ltrim(key, 0, 4);
+                    await redis.expire(key, CACHE_TTL_SEARCH_HISTORY);
+                    return json({ saved: true });
+                } catch {
+                    return json({ saved: false });
+                }
             }
 
             // --- Root ---
