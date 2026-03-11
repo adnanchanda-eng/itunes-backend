@@ -3,10 +3,16 @@ import Redis from "ioredis";
 // Redis client for caching — connects using REDIS_URL env var
 // All cache operations are wrapped in try/catch so Redis failures
 // never break the application (graceful fallback to DB)
-const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
+const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
+
+// Upstash requires TLS — auto-enable if the URL contains "upstash.io"
+const isUpstash = redisUrl.includes("upstash.io");
+
+const redis = new Redis(redisUrl, {
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
     keepAlive: 10000,
+    ...(isUpstash && { tls: { rejectUnauthorized: false } }),
     retryStrategy(times) {
         // Retry with exponential backoff, max 3 seconds, stop after 10 retries
         if (times > 10) return null;
