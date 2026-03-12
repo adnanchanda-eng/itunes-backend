@@ -31,15 +31,21 @@ function snakeKeys(obj: unknown): unknown {
     return obj;
 }
 
-function json(data: unknown, status = 200) {
+function json(data: unknown, status = 200, cacheStatus?: "HIT" | "MISS") {
+    const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    };
+
+    if (cacheStatus) {
+        headers["X-Cache"] = cacheStatus;
+    }
+
     return new Response(JSON.stringify(snakeKeys(data)), {
         status,
-        headers: {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
-        },
+        headers,
     });
 }
 
@@ -165,7 +171,7 @@ const server = Bun.serve({
 
                 // Check cache first
                 const cached = await cacheGet(cacheKey);
-                if (cached) return json(cached);
+                if (cached) return json(cached, 200, "HIT");
 
                 const result = await db
                     .select({
@@ -183,7 +189,7 @@ const server = Bun.serve({
                     .orderBy(sql`${playlists.createdAt} DESC`);
 
                 await cacheSet(cacheKey, result, CACHE_TTL_PLAYLISTS);
-                return json(result);
+                return json(result, 200, "MISS");
             }
 
             // Remove a song from a playlist (owner only)
@@ -328,7 +334,7 @@ const server = Bun.serve({
 
                 // Check cache first
                 const cached = await cacheGet(cacheKey);
-                if (cached) return json(cached);
+                if (cached) return json(cached, 200, "HIT");
 
                 const result = await db
                     .select({
@@ -351,7 +357,7 @@ const server = Bun.serve({
                     .orderBy(sql`${playlists.createdAt} DESC`);
 
                 await cacheSet(cacheKey, result, CACHE_TTL_PLAYLISTS);
-                return json(result);
+                return json(result, 200, "MISS");
             }
 
             // Add a song to a playlist (owner only)
@@ -404,7 +410,7 @@ const server = Bun.serve({
 
                 // Check cache first
                 const cached = await cacheGet(cacheKey);
-                if (cached) return json(cached);
+                if (cached) return json(cached, 200, "HIT");
 
                 const playlist = await db.select().from(playlists).where(eq(playlists.id, playlistId));
                 if (playlist.length === 0) return json({ error: "Playlist not found" }, 404);
