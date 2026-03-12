@@ -860,6 +860,26 @@ const server = Bun.serve({
                 }
             }
 
+            // Remove a song from user's search history
+            if (path === "/api/search-history" && method === "DELETE") {
+                const clerk_id = url.searchParams.get("clerk_id");
+                const song_id = url.searchParams.get("song_id");
+                if (!clerk_id || !song_id) return json({ error: "clerk_id and song_id are required" }, 400);
+
+                const key = `search:recent-songs:${clerk_id}`;
+                try {
+                    const cached = await redis.get(key);
+                    if (cached) {
+                        const history = JSON.parse(cached);
+                        const newHistory = history.filter((s: any) => s.id !== song_id);
+                        await redis.set(key, JSON.stringify(newHistory), "EX", CACHE_TTL_SEARCH_HISTORY);
+                    }
+                    return json({ removed: true });
+                } catch {
+                    return json({ removed: false });
+                }
+            }
+
             // --- Root ---
             if (path === "/") return json({ message: "iTunes Backend API" });
 
