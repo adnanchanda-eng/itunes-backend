@@ -1,17 +1,17 @@
 import crypto from "crypto";
 
 import { createClerkClient } from "@clerk/backend";
-import { eq, sql, and } from "drizzle-orm";
+import { eq, sql, and, desc } from "drizzle-orm";
 
 import { db } from "./db";
-import { users, playlists, playlistSongs, playlistShares, playlistShareTokens, playlistClaimCopies, pendingPlaylistShares, emailInvitationTokens } from "./db/schema";
+import { users, playlists, playlistSongs, playlistShares, playlistShareTokens, playlistClaimCopies, pendingPlaylistShares, emailInvitationTokens, songSearchCounts, songListenCounts } from "./db/schema";
 import { cacheGet, cacheSet, cacheDel, cacheDelPattern, redis } from "./redis";
 
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY! });
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
 // Cache TTL constants (seconds)
-const CACHE_TTL_PLAYLISTS = 300;   // 5 minutes
+const CACHE_TTL_PLAYLISTS = 86400;   // 1 day
 const CACHE_TTL_SEARCH_HISTORY = 604800; // 7 days
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -34,9 +34,9 @@ function snakeKeys(obj: unknown): unknown {
 function json(data: unknown, status = 200, cacheStatus?: "HIT" | "MISS") {
     const headers: Record<string, string> = {
         "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Origin": FRONTEND_URL,
         "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
     };
 
     if (cacheStatus) {
@@ -53,9 +53,9 @@ function corsHeaders() {
     return new Response(null, {
         status: 204,
         headers: {
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": FRONTEND_URL,
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
         },
     });
 }
@@ -75,7 +75,7 @@ const server = Bun.serve({
 
             // Sync user from Clerk (call after login/signup)
             if (path === "/api/users/sync" && method === "POST") {
-                const { clerk_id, username, email, first_name, last_name, profile_image } = await req.json();
+                const { clerk_id, username, email, first_name, last_name, profile_image } = (await req.json()) as Record<string, any>;
                 if (!clerk_id) return json({ error: "clerk_id is required" }, 400);
 
                 const result = await db
@@ -139,7 +139,7 @@ const server = Bun.serve({
 
             // Create a playlist
             if (path === "/api/playlists" && method === "POST") {
-                const { clerk_id, name, description } = await req.json();
+                const { clerk_id, name, description } = (await req.json()) as Record<string, any>;
                 if (!clerk_id || !name) return json({ error: "clerk_id and name are required" }, 400);
 
                 // Ensure user exists (prevents FK violation if UserSync hasn't completed)
@@ -229,7 +229,7 @@ const server = Bun.serve({
             const shareMatch = path.match(/^\/api\/playlists\/(\d+)\/share$/);
             if (shareMatch && method === "POST") {
                 const playlistId = parseInt(shareMatch[1]);
-                const { email, shared_by_clerk_id } = await req.json();
+                const { email, shared_by_clerk_id } = (await req.json()) as Record<string, any>;
                 if (!email || !shared_by_clerk_id) return json({ error: "email and shared_by_clerk_id are required" }, 400);
 
                 const emailTrimmed = String(email).trim();
@@ -363,7 +363,7 @@ const server = Bun.serve({
             // Add a song to a playlist (owner only)
             const addSongMatch = path.match(/^\/api\/playlists\/(\d+)\/songs$/);
             if (addSongMatch && method === "POST") {
-                const { track_id, title, artist_name, album_art, preview_url, collection_name, duration, clerk_id } = await req.json();
+                const { track_id, title, artist_name, album_art, preview_url, collection_name, duration, clerk_id } = (await req.json()) as Record<string, any>;
                 if (!track_id || !title || !artist_name) {
                     return json({ error: "track_id, title, and artist_name are required" }, 400);
                 }
@@ -469,7 +469,7 @@ const server = Bun.serve({
 
             // Update a playlist (owner only)
             if (playlistMatch && method === "PUT") {
-                const { name, description, clerk_id } = await req.json();
+                const { name, description, clerk_id } = (await req.json()) as Record<string, any>;
                 const playlistId = parseInt(playlistMatch[1]);
 
                 if (!clerk_id) return json({ error: "clerk_id is required" }, 400);
@@ -527,7 +527,7 @@ const server = Bun.serve({
             const createShareLinkMatch = path.match(/^\/api\/playlists\/(\d+)\/share-link$/);
             if (createShareLinkMatch && method === "POST") {
                 const playlistId = parseInt(createShareLinkMatch[1]);
-                const { clerk_id } = await req.json();
+                const { clerk_id } = (await req.json()) as Record<string, any>;
                 if (!clerk_id) return json({ error: "clerk_id is required" }, 400);
 
                 // Verify playlist exists and belongs to caller
@@ -595,7 +595,7 @@ const server = Bun.serve({
             const claimByTokenMatch = path.match(/^\/api\/playlists\/claim-by-token\/([a-fA-F0-9]+)$/);
             if (claimByTokenMatch && method === "POST") {
                 const token = claimByTokenMatch[1];
-                const { clerk_id } = await req.json();
+                const { clerk_id } = (await req.json()) as Record<string, any>;
                 if (!clerk_id) return json({ error: "clerk_id is required" }, 400);
 
                 const tokenRecord = await db
@@ -819,7 +819,7 @@ const server = Bun.serve({
 
             // --- User Search History (Redis-backed) ---
 
-            // Get user's recent search history (last 5 songs)
+            // Get user's recent search history (last 10 songs)
             const searchHistoryGetMatch = path.match(/^\/api\/search-history\/(.+)$/);
             if (searchHistoryGetMatch && method === "GET") {
                 const clerkId = decodeURIComponent(searchHistoryGetMatch[1]);
@@ -851,15 +851,15 @@ const server = Bun.serve({
 
                 const key = `search:recent-songs:${clerk_id}`;
                 try {
-                    // Fetch existing, prepend new (filtering out duplicates), slice to 5, save
+                    // Fetch existing, prepend new (filtering out duplicates), slice to 10, save
                     let history = [];
                     const cached = await redis.get(key);
                     if (cached) {
                         history = JSON.parse(cached);
                     }
-                    
-                    history = [song, ...history.filter((s: any) => s.id !== song.id)].slice(0, 5);
-                    
+
+                    history = [song, ...history.filter((s: any) => s.id !== song.id)].slice(0, 10);
+
                     await redis.set(key, JSON.stringify(history), "EX", CACHE_TTL_SEARCH_HISTORY);
                     return json({ saved: true });
                 } catch {
@@ -885,6 +885,96 @@ const server = Bun.serve({
                 } catch {
                     return json({ removed: false });
                 }
+            }
+
+            // --- Most Searched (DB-backed, frequency-based) ---
+
+            // Increment search count when user plays a song from search results
+            if (path === "/api/most-searched" && method === "POST") {
+                const { clerk_id, song } = await req.json() as { clerk_id?: string; song?: any };
+                if (!clerk_id || !song || !song.id) return json({ error: "clerk_id and valid song object are required" }, 400);
+
+                await db
+                    .insert(songSearchCounts)
+                    .values({ clerkId: clerk_id, trackId: song.id, count: 1, songData: song })
+                    .onConflictDoUpdate({
+                        target: [songSearchCounts.clerkId, songSearchCounts.trackId],
+                        set: {
+                            count: sql`${songSearchCounts.count} + 1`,
+                            songData: sql`excluded.song_data`,
+                            lastSearchedAt: sql`NOW()`,
+                        },
+                    });
+
+                return json({ saved: true });
+            }
+
+            // Get user's most searched songs ordered by frequency
+            const mostSearchedMatch = path.match(/^\/api\/most-searched\/(.+)$/);
+            if (mostSearchedMatch && method === "GET") {
+                const clerkId = decodeURIComponent(mostSearchedMatch[1]);
+                const rows = await db
+                    .select()
+                    .from(songSearchCounts)
+                    .where(eq(songSearchCounts.clerkId, clerkId))
+                    .orderBy(desc(songSearchCounts.count))
+                    .limit(20);
+
+                const songs = rows.map((r) => ({ song: r.songData, count: r.count }));
+                return new Response(JSON.stringify({ songs }), {
+                    status: 200,
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Access-Control-Allow-Origin": FRONTEND_URL,
+                        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                    },
+                });
+            }
+
+            // --- Most Listened (DB-backed, frequency-based) ---
+
+            // Increment listen count when user plays any song
+            if (path === "/api/most-listened" && method === "POST") {
+                const { clerk_id, song } = await req.json() as { clerk_id?: string; song?: any };
+                if (!clerk_id || !song || !song.id) return json({ error: "clerk_id and valid song object are required" }, 400);
+
+                await db
+                    .insert(songListenCounts)
+                    .values({ clerkId: clerk_id, trackId: song.id, count: 1, songData: song })
+                    .onConflictDoUpdate({
+                        target: [songListenCounts.clerkId, songListenCounts.trackId],
+                        set: {
+                            count: sql`${songListenCounts.count} + 1`,
+                            songData: sql`excluded.song_data`,
+                            lastListenedAt: sql`NOW()`,
+                        },
+                    });
+
+                return json({ saved: true });
+            }
+
+            // Get user's most listened songs ordered by frequency
+            const mostListenedMatch = path.match(/^\/api\/most-listened\/(.+)$/);
+            if (mostListenedMatch && method === "GET") {
+                const clerkId = decodeURIComponent(mostListenedMatch[1]);
+                const rows = await db
+                    .select()
+                    .from(songListenCounts)
+                    .where(eq(songListenCounts.clerkId, clerkId))
+                    .orderBy(desc(songListenCounts.count))
+                    .limit(20);
+
+                const songs = rows.map((r) => ({ song: r.songData, count: r.count }));
+                return new Response(JSON.stringify({ songs }), {
+                    status: 200,
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Access-Control-Allow-Origin": FRONTEND_URL,
+                        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                    },
+                });
             }
 
             // --- Root ---

@@ -1,4 +1,4 @@
-import { pgTable, serial, varchar, text, integer, timestamp, uniqueIndex, index, boolean } from "drizzle-orm/pg-core";
+import { pgTable, serial, varchar, text, integer, timestamp, uniqueIndex, index, boolean, jsonb } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 
 export const users = pgTable(
@@ -157,6 +157,44 @@ export const playlistClaimCopies = pgTable(
     (table) => [
         uniqueIndex("playlist_claim_copies_token_claimed_unique").on(table.token, table.claimedByClerkId),
         index("idx_playlist_claim_copies_token").on(table.token),
+    ]
+);
+
+// Tracks how many times a user has played a song from search results (most searched)
+export const songSearchCounts = pgTable(
+    "song_search_counts",
+    {
+        id: serial("id").primaryKey(),
+        clerkId: varchar("clerk_id", { length: 255 })
+            .notNull()
+            .references(() => users.clerkId, { onDelete: "cascade" }),
+        trackId: varchar("track_id", { length: 255 }).notNull(),
+        count: integer("count").notNull().default(1),
+        songData: jsonb("song_data").notNull(),
+        lastSearchedAt: timestamp("last_searched_at").defaultNow(),
+    },
+    (table) => [
+        uniqueIndex("song_search_counts_clerk_track_unique").on(table.clerkId, table.trackId),
+        index("idx_song_search_counts_clerk_id").on(table.clerkId),
+    ]
+);
+
+// Tracks how many times a user has listened to any song (most listened)
+export const songListenCounts = pgTable(
+    "song_listen_counts",
+    {
+        id: serial("id").primaryKey(),
+        clerkId: varchar("clerk_id", { length: 255 })
+            .notNull()
+            .references(() => users.clerkId, { onDelete: "cascade" }),
+        trackId: varchar("track_id", { length: 255 }).notNull(),
+        count: integer("count").notNull().default(1),
+        songData: jsonb("song_data").notNull(),
+        lastListenedAt: timestamp("last_listened_at").defaultNow(),
+    },
+    (table) => [
+        uniqueIndex("song_listen_counts_clerk_track_unique").on(table.clerkId, table.trackId),
+        index("idx_song_listen_counts_clerk_id").on(table.clerkId),
     ]
 );
 
