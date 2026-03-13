@@ -588,7 +588,7 @@ const server = Bun.serve({
                     owner_name: owner.length > 0
                         ? [owner[0].firstName, owner[0].lastName].filter(Boolean).join(" ") || owner[0].username || owner[0].email
                         : null,
-                });
+                }, 200, "MISS");
             }
 
             // Claim a playlist via share token (authenticated) — creates a COPY owned by claimant for full ownership
@@ -836,6 +836,7 @@ const server = Bun.serve({
                             "Access-Control-Allow-Origin": "*",
                             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
                             "Access-Control-Allow-Headers": "Content-Type",
+                            "X-Cache": cached ? "HIT" : "MISS",
                         },
                     });
                 } catch {
