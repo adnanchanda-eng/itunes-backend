@@ -977,6 +977,111 @@ const server = Bun.serve({
                 });
             }
 
+            // --- Doppelgänger Mode ---
+
+            // Helper: respond without snake_case conversion (personas use camelCase throughout)
+            const doppelgangerJson = (data: unknown, status = 200) =>
+                new Response(JSON.stringify(data), {
+                    status,
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Access-Control-Allow-Origin": FRONTEND_URL,
+                        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                    },
+                });
+
+            // Push artist to listening history (keep last 30)
+            if (path === "/api/doppelganger/history" && method === "POST") {
+                const { userId, artistName } = (await req.json()) as { userId?: string; artistName?: string };
+                if (!userId || !artistName) return doppelgangerJson({ error: "userId and artistName required" }, 400);
+                await redis.lpush(`doppelganger:history:${userId}`, artistName);
+                await redis.ltrim(`doppelganger:history:${userId}`, 0, 29);
+                return doppelgangerJson({ saved: true });
+            }
+
+            // Generate 4 alternate-universe personas via Gemini 1.5 Flash
+            if (path === "/api/doppelganger/generate" && method === "POST") {
+                const { userId } = (await req.json()) as { userId?: string };
+                if (!userId) return doppelgangerJson({ error: "userId required" }, 400);
+
+                const history = await redis.lrange(`doppelganger:history:${userId}`, 0, -1);
+                const artistList = history.length > 0 ? history.join(", ") : "pop music, top hits, mainstream radio";
+
+                const systemPrompt =
+                    `You are a music identity engine. Given a user's listening history, generate exactly 4 ` +
+                    `alternate-universe music personas they could have become if their taste evolved one degree ` +
+                    `differently. CRITICAL: You must stay within the same language and cultural sphere as the ` +
+                    `user's history. If they listen to Bollywood/Hindi music, all personas and searchTerms must ` +
+                    `be Bollywood/Hindi variants. If they listen to K-pop, stay in K-pop. Never shift to English ` +
+                    `or Western music unless the history is already Western. The personas should be alternate ` +
+                    `versions within their own culture — not a cultural replacement. ` +
+                    `Return ONLY a JSON array, no explanation, no markdown. ` +
+                    `Each object must have: id (short slug e.g. 'retro-filmi'), name (evocative title starting ` +
+                    `with 'You, if...' e.g. 'You, if you fell into a 90s Bollywood fever dream'), tagline (1 sentence ` +
+                    `mood description), theme (one of [dark, warm, cold, minimal, cinematic, chaotic, nostalgic, ` +
+                    `futuristic]), searchTerms (array of 5 iTunes search keywords in the user's language/genre ` +
+                    `matching this persona), accentColor (hex color that fits the mood)`;
+
+                const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "x-api-key": process.env.ANTHROPIC_API_KEY!,
+                        "anthropic-version": "2023-06-01",
+                    },
+                    body: JSON.stringify({
+                        model: "claude-haiku-4-5-20251001",
+                        max_tokens: 1000,
+                        system: systemPrompt,
+                        messages: [
+                            { role: "user", content: "User history: " + artistList },
+                        ],
+                    }),
+                });
+
+                const claudeData = (await claudeRes.json()) as any;
+                console.log("[CLAUDE] status:", claudeRes.status, "response:", JSON.stringify(claudeData).slice(0, 400));
+
+                if (!claudeRes.ok || !claudeData.content?.[0]) {
+                    const errMsg = claudeData.error?.message ?? `Claude HTTP ${claudeRes.status}`;
+                    return doppelgangerJson({ error: errMsg }, 502);
+                }
+
+                const rawText: string = claudeData.content[0].text ?? "[]";
+                const personas = JSON.parse(rawText.replace(/```json|```/g, "").trim());
+                return doppelgangerJson({ personas });
+            }
+
+            // Activate a doppelganger channel for 24 hours
+            if (path === "/api/doppelganger/activate" && method === "POST") {
+                const { userId, channel } = (await req.json()) as { userId?: string; channel?: unknown };
+                if (!userId || !channel) return doppelgangerJson({ error: "userId and channel required" }, 400);
+                await redis.set(`doppelganger:channel:${userId}`, JSON.stringify(channel), "EX", 86400);
+                return doppelgangerJson({ success: true, expiresAt: Date.now() + 86400000 });
+            }
+
+            // Get current doppelganger state for a user
+            const doppelgangerStateMatch = path.match(/^\/api\/doppelganger\/state\/(.+)$/);
+            if (doppelgangerStateMatch && method === "GET") {
+                const userId = decodeURIComponent(doppelgangerStateMatch[1]);
+                const channelJson = await redis.get(`doppelganger:channel:${userId}`);
+                if (!channelJson) return doppelgangerJson(null);
+                const channel = JSON.parse(channelJson) as { id: string };
+                const ttl = await redis.ttl(`doppelganger:channel:${userId}`);
+                const driftRaw = await redis.get(`doppelganger:drift:${userId}:${channel.id}`);
+                const driftScore = driftRaw ? parseInt(driftRaw, 10) : 0;
+                return doppelgangerJson({ channel, driftScore, expiresAt: Date.now() + ttl * 1000 });
+            }
+
+            // Increment drift score when a song plays in doppelganger mode
+            if (path === "/api/doppelganger/drift" && method === "POST") {
+                const { userId, channelId } = (await req.json()) as { userId?: string; channelId?: string };
+                if (!userId || !channelId) return doppelgangerJson({ error: "userId and channelId required" }, 400);
+                const driftScore = await redis.incr(`doppelganger:drift:${userId}:${channelId}`);
+                return doppelgangerJson({ driftScore, isPermanent: driftScore >= 80 });
+            }
+
             // --- Root ---
             if (path === "/") return json({ message: "iTunes Backend API" });
 
