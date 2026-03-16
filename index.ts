@@ -16,6 +16,15 @@ const CACHE_TTL_SEARCH_HISTORY = 604800; // 7 days
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Allow any localhost origin in development so port changes don't break CORS
+function getAllowedOrigin(req: Request): string {
+    const origin = req.headers.get("origin") || "";
+    if (origin.startsWith("http://localhost:") || origin.startsWith("http://127.0.0.1:")) {
+        return origin;
+    }
+    return FRONTEND_URL;
+}
+
 // Convert camelCase keys to snake_case to preserve the existing API contract
 function toSnake(str: string): string {
     return str.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
@@ -31,10 +40,10 @@ function snakeKeys(obj: unknown): unknown {
     return obj;
 }
 
-function json(data: unknown, status = 200, cacheStatus?: "HIT" | "MISS") {
+function _json(data: unknown, status = 200, cacheStatus?: "HIT" | "MISS", req?: Request) {
     const headers: Record<string, string> = {
         "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": FRONTEND_URL,
+        "Access-Control-Allow-Origin": req ? getAllowedOrigin(req) : FRONTEND_URL,
         "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
     };
@@ -49,11 +58,11 @@ function json(data: unknown, status = 200, cacheStatus?: "HIT" | "MISS") {
     });
 }
 
-function corsHeaders() {
+function corsHeaders(req: Request) {
     return new Response(null, {
         status: 204,
         headers: {
-            "Access-Control-Allow-Origin": FRONTEND_URL,
+            "Access-Control-Allow-Origin": getAllowedOrigin(req),
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, Authorization",
         },
@@ -68,7 +77,11 @@ const server = Bun.serve({
         const path = url.pathname;
         const method = req.method;
 
-        if (method === "OPTIONS") return corsHeaders();
+        if (method === "OPTIONS") return corsHeaders(req);
+
+        // Request-aware json helper — all responses carry the correct CORS origin
+        const json = (data: unknown, status = 200, cacheStatus?: "HIT" | "MISS") =>
+            _json(data, status, cacheStatus, req);
 
         try {
             // --- Users (synced from Clerk) ---
@@ -985,7 +998,7 @@ const server = Bun.serve({
                     status,
                     headers: {
                         "Content-Type": "application/json",
-                        "Access-Control-Allow-Origin": FRONTEND_URL,
+                        "Access-Control-Allow-Origin": getAllowedOrigin(req),
                         "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
                         "Access-Control-Allow-Headers": "Content-Type, Authorization",
                     },
@@ -1010,15 +1023,16 @@ const server = Bun.serve({
 
                 const systemPrompt =
                     `You are a music identity engine. Given a user's listening history, generate exactly 4 ` +
-                    `alternate-universe music personas they could have become if their taste evolved one degree ` +
-                    `differently. CRITICAL: You must stay within the same language and cultural sphere as the ` +
-                    `user's history. If they listen to Bollywood/Hindi music, all personas and searchTerms must ` +
-                    `be Bollywood/Hindi variants. If they listen to K-pop, stay in K-pop. Never shift to English ` +
-                    `or Western music unless the history is already Western. The personas should be alternate ` +
-                    `versions within their own culture — not a cultural replacement. ` +
+                    `alternate-universe music personas they could have become if their taste evolved one degree differently.\n` +
+                    `CRITICAL CULTURAL RULES — violation is a serious error:\n` +
+                    `1. South Indian music (Tamil/Telugu/Kannada/Malayalam artists like Anirudh, AR Rahman Tamil, Ilayaraja, DSP, Sid Sriram, Yuvan) is COMPLETELY SEPARATE from Bollywood or Punjabi. If history has South Indian artists, all 4 personas must be South Indian variants ONLY.\n` +
+                    `2. Bollywood = Hindi film music. Punjabi = Bhangra/Punjabi pop. These are different from each other too.\n` +
+                    `3. Sufi/Qawwali = Urdu devotional music. Keep personas in that world.\n` +
+                    `4. NEVER mix South Indian with North Indian. NEVER mix Sufi with pop. Stay strictly within the detected culture.\n` +
+                    `5. If history has K-pop → K-pop personas only. Western → Western only. Never shift cultures.\n` +
                     `Return ONLY a JSON array, no explanation, no markdown. ` +
-                    `Each object must have: id (short slug e.g. 'retro-filmi'), name (evocative title starting ` +
-                    `with 'You, if...' e.g. 'You, if you fell into a 90s Bollywood fever dream'), tagline (1 sentence ` +
+                    `Each object must have: id (short slug e.g. 'kollywood-noir'), name (evocative title starting ` +
+                    `with 'You, if...' e.g. 'You, if you got lost in an Anirudh fever dream'), tagline (1 sentence ` +
                     `mood description), theme (one of [dark, warm, cold, minimal, cinematic, chaotic, nostalgic, ` +
                     `futuristic]), searchTerms (array of 5 iTunes search keywords in the user's language/genre ` +
                     `matching this persona), accentColor (hex color that fits the mood)`;
@@ -1080,6 +1094,312 @@ const server = Bun.serve({
                 if (!userId || !channelId) return doppelgangerJson({ error: "userId and channelId required" }, 400);
                 const driftScore = await redis.incr(`doppelganger:drift:${userId}:${channelId}`);
                 return doppelgangerJson({ driftScore, isPermanent: driftScore >= 80 });
+            }
+
+            // --- Auto-Blend Mode ---
+
+            // Detect listening pattern from recent history and return a blend (or null)
+            if (path === "/api/blend/detect" && method === "POST") {
+                const { userId } = (await req.json()) as { userId?: string };
+                if (!userId) return doppelgangerJson({ error: "userId required" }, 400);
+
+                const history = await redis.lrange(`doppelganger:history:${userId}`, 0, 9);
+                if (history.length < 4) return doppelgangerJson({ blend: null });
+
+                const blendSystemPrompt =
+                    `You are a music atmosphere engine. Analyze recent artist names and detect a strong listening pattern.\n\n` +
+                    `Return null (literally the word null, no JSON) if: fewer than 4 artists, no clear pattern, or confidence < 0.75.\n\n` +
+
+                    `=== CRITICAL CULTURAL ACCURACY RULES ===\n` +
+                    `These are NON-NEGOTIABLE. Getting these wrong is a serious error:\n` +
+                    `1. SOUTH INDIAN music (Tamil, Telugu, Kannada, Malayalam — artists like A.R. Rahman, Anirudh Ravichander, S.P. Balasubrahmanyam, Ilayaraja, Devi Sri Prasad, Sid Sriram, Yuvan Shankar Raja, Shreya Ghoshal in Tamil context) is a COMPLETELY SEPARATE culture from North Indian/Bollywood/Punjabi. NEVER detect South Indian artists as Bollywood or Punjabi. South Indian has its own blend: id="south-indian-cinema".\n` +
+                    `2. BOLLYWOOD = Hindi film industry (Mumbai). Artists: Arijit Singh, Shreya Ghoshal Hindi songs, Pritam, Vishal-Shekhar, A.R. Rahman Hindi work.\n` +
+                    `3. PUNJABI = Bhangra/Punjabi pop. Artists: Diljit Dosanjh, AP Dhillon, Sidhu Moosewala, Guru Randhawa.\n` +
+                    `4. SUFI/QAWWALI = Urdu devotional. Artists: Nusrat Fateh Ali Khan, Rahat Fateh Ali Khan, Abida Parveen, Sabri Brothers. NEVER mix with mainstream pop.\n` +
+                    `5. If you see Tamil/Telugu artist names → South Indian blend ONLY.\n` +
+                    `6. If you see both South Indian and North Indian artists → use whichever has more artists. If tied → return null.\n\n` +
+
+                    `=== MOOD SYSTEM ===\n` +
+                    `Pick exactly one mood:\n` +
+                    `- "vibrant"    → Bollywood, Punjabi/Bhangra, K-pop, Latin pop, Afrobeats, South Indian mass masala — FESTIVAL energy\n` +
+                    `- "energetic"  → Hip-hop, rock, metal, EDM, South Indian action/thriller BGMs\n` +
+                    `- "ethereal"   → Sufi, Qawwali, Ghazal, Carnatic classical, devotional — meditative, sacred\n` +
+                    `- "serene"     → Jazz, lo-fi, acoustic, South Indian melody/melody-classical fusion — calm, introspective\n` +
+                    `- "melancholic"→ Blues, soul, indie folk, sad ballads — emotional, cinematic\n\n` +
+
+                    `=== COLOR PALETTES BY GENRE ===\n` +
+                    `Use these exact values. Deviate only if the genre is unlisted.\n\n` +
+
+                    `VIBRANT — festival, party, maximum color:\n` +
+                    `  Bollywood:         surface=#150800, accent=#f59e0b, accentHover=#fbbf24, overlay=rgba(245,158,11,0.16),  grain=0.2, vignette=0.35, scanlines=false\n` +
+                    `  Punjabi/Bhangra:   surface=#130015, accent=#e879f9, accentHover=#f0abfc, overlay=rgba(232,121,249,0.16), grain=0.2, vignette=0.3,  scanlines=false\n` +
+                    `  South Indian Mass: surface=#001008, accent=#10b981, accentHover=#34d399, overlay=rgba(16,185,129,0.16),  grain=0.2, vignette=0.35, scanlines=false\n` +
+                    `  K-pop:             surface=#0d0020, accent=#a855f7, accentHover=#c084fc, overlay=rgba(168,85,247,0.16),  grain=0.15,vignette=0.3,  scanlines=false\n` +
+                    `  Latin/Afrobeats:   surface=#130c00, accent=#fb923c, accentHover=#fdba74, overlay=rgba(251,146,60,0.16),  grain=0.2, vignette=0.35, scanlines=false\n\n` +
+
+                    `ENERGETIC — electric, sharp:\n` +
+                    `  South Indian Action/Thriller: surface=#00050f, accent=#38bdf8, accentHover=#7dd3fc, overlay=rgba(56,189,248,0.14),  grain=0.25,vignette=0.45, scanlines=false\n` +
+                    `  Hip-hop:           surface=#0a0900, accent=#facc15, accentHover=#fde047, overlay=rgba(250,204,21,0.14),  grain=0.25,vignette=0.45, scanlines=false\n` +
+                    `  Rock/Metal:        surface=#0f0500, accent=#f97316, accentHover=#fb923c, overlay=rgba(249,115,22,0.14),  grain=0.35,vignette=0.5,  scanlines=true\n` +
+                    `  EDM/House:         surface=#00060f, accent=#22d3ee, accentHover=#67e8f9, overlay=rgba(34,211,238,0.14),  grain=0.15,vignette=0.4,  scanlines=false\n\n` +
+
+                    `ETHEREAL — sacred, ancient, candle-lit:\n` +
+                    `  Sufi/Qawwali:      surface=#030b06, accent=#34d399, accentHover=#6ee7b7, overlay=rgba(52,211,153,0.08),  grain=0.55,vignette=0.65, scanlines=false\n` +
+                    `  Ghazal/Urdu:       surface=#060310, accent=#a78bfa, accentHover=#c4b5fd, overlay=rgba(167,139,250,0.08), grain=0.6, vignette=0.7,  scanlines=false\n` +
+                    `  Carnatic Classical:surface=#050010, accent=#c084fc, accentHover=#d8b4fe, overlay=rgba(192,132,252,0.08), grain=0.55,vignette=0.65, scanlines=false\n` +
+                    `  Devotional/Bhajan: surface=#0a0500, accent=#fcd34d, accentHover=#fde68a, overlay=rgba(252,211,77,0.07),  grain=0.6, vignette=0.65, scanlines=false\n\n` +
+
+                    `SERENE — calm, late-night:\n` +
+                    `  South Indian Melody: surface=#00080f, accent=#67e8f9, accentHover=#a5f3fc, overlay=rgba(103,232,249,0.08), grain=0.4, vignette=0.5, scanlines=false\n` +
+                    `  Jazz:              surface=#04030d, accent=#818cf8, accentHover=#a5b4fc, overlay=rgba(129,140,248,0.08), grain=0.45,vignette=0.55, scanlines=false\n` +
+                    `  Lo-fi/Chill:       surface=#030a07, accent=#4ade80, accentHover=#86efac, overlay=rgba(74,222,128,0.07),  grain=0.5, vignette=0.5,  scanlines=false\n` +
+                    `  Acoustic/Indie:    surface=#06050f, accent=#f9a8d4, accentHover=#fbcfe8, overlay=rgba(249,168,212,0.07), grain=0.4, vignette=0.5,  scanlines=false\n\n` +
+
+                    `MELANCHOLIC — emotional, deep:\n` +
+                    `  Blues/Soul:        surface=#020810, accent=#60a5fa, accentHover=#93c5fd, overlay=rgba(96,165,250,0.1),   grain=0.5, vignette=0.6,  scanlines=false\n` +
+                    `  Indie Folk:        surface=#050a03, accent=#a3e635, accentHover=#bef264, overlay=rgba(163,230,53,0.09),  grain=0.45,vignette=0.55, scanlines=false\n\n` +
+
+                    `Return ONLY valid JSON (or null) with this exact schema:\n` +
+                    `{\n` +
+                    `  "id": "short-slug",\n` +
+                    `  "label": "Display Name",\n` +
+                    `  "confidence": 0.88,\n` +
+                    `  "description": "one evocative sentence capturing this vibe",\n` +
+                    `  "mood": "vibrant",\n` +
+                    `  "searchTerms": ["term1", "term2", "term3", "term4", "term5"],\n` +
+                    `  "theme": {\n` +
+                    `    "cssVars": {\n` +
+                    `      "--color-surface": "#hex",\n` +
+                    `      "--color-surface-elevated": "rgba(r,g,b,0.08)",\n` +
+                    `      "--color-surface-hover": "rgba(r,g,b,0.15)",\n` +
+                    `      "--color-surface-sidebar": "rgba(r,g,b,0.06)",\n` +
+                    `      "--color-surface-list": "rgba(r,g,b,0.09)",\n` +
+                    `      "--color-accent": "#hex",\n` +
+                    `      "--color-accent-hover": "#hex",\n` +
+                    `      "--color-text-primary": "#ffffff",\n` +
+                    `      "--color-text-secondary": "#e2e8f0",\n` +
+                    `      "--color-text-tertiary": "#94a3b8",\n` +
+                    `      "--color-border": "rgba(r,g,b,0.2)"\n` +
+                    `    },\n` +
+                    `    "overlayColor": "rgba(r,g,b,0.14)",\n` +
+                    `    "grainOpacity": 0.3,\n` +
+                    `    "vignetteOpacity": 0.45,\n` +
+                    `    "scanlines": false\n` +
+                    `  }\n` +
+                    `}`;
+
+                const blendClaudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "x-api-key": process.env.ANTHROPIC_API_KEY!,
+                        "anthropic-version": "2023-06-01",
+                    },
+                    body: JSON.stringify({
+                        model: "claude-haiku-4-5-20251001",
+                        max_tokens: 1500,
+                        system: blendSystemPrompt,
+                        messages: [
+                            { role: "user", content: "Recent artists: " + history.join(", ") },
+                        ],
+                    }),
+                });
+
+                const blendClaudeData = (await blendClaudeRes.json()) as any;
+                if (!blendClaudeRes.ok || !blendClaudeData.content?.[0]) {
+                    const errMsg = blendClaudeData.error?.message ?? `Claude HTTP ${blendClaudeRes.status}`;
+                    return doppelgangerJson({ error: errMsg }, 502);
+                }
+
+                const blendRawText: string = (blendClaudeData.content[0].text ?? "").trim();
+                if (blendRawText === "null") return doppelgangerJson({ blend: null });
+
+                try {
+                    const blend = JSON.parse(blendRawText.replace(/```json|```/g, "").trim());
+                    return doppelgangerJson({ blend });
+                } catch {
+                    return doppelgangerJson({ blend: null });
+                }
+            }
+
+            // Activate a blend for 30 minutes
+            if (path === "/api/blend/activate" && method === "POST") {
+                const { userId, blend } = (await req.json()) as { userId?: string; blend?: unknown };
+                if (!userId || !blend) return doppelgangerJson({ error: "userId and blend required" }, 400);
+                await redis.set(`blend:active:${userId}`, JSON.stringify(blend), "EX", 1800);
+                return doppelgangerJson({ success: true, expiresAt: Date.now() + 1800000 });
+            }
+
+            // Get current blend state for a user
+            const blendStateMatch = path.match(/^\/api\/blend\/state\/(.+)$/);
+            if (blendStateMatch && method === "GET") {
+                const userId = decodeURIComponent(blendStateMatch[1]);
+                const blendJson = await redis.get(`blend:active:${userId}`);
+                if (!blendJson) return doppelgangerJson(null);
+                const blend = JSON.parse(blendJson);
+                const ttl = await redis.ttl(`blend:active:${userId}`);
+                return doppelgangerJson({ blend, expiresAt: Date.now() + ttl * 1000 });
+            }
+
+            // Generate a full blend theme for a given mood + cultural context (no hardcoded colors)
+            if (path === "/api/blend/from-mood" && method === "POST") {
+                const { mood, recentArtists } = (await req.json()) as { mood?: string; recentArtists?: string[] };
+                if (!mood) return doppelgangerJson({ error: "mood required" }, 400);
+
+                const cacheKey = `blend:from-mood:${mood}:${(recentArtists ?? []).slice(0, 3).join(",").toLowerCase()}`;
+                const cached = await redis.get(cacheKey);
+                if (cached) return doppelgangerJson(JSON.parse(cached));
+
+                const fromMoodPrompt =
+                    `You are a music atmosphere designer. Generate a full visual blend theme for a music app based on the detected mood and cultural context of recent artists.\n\n` +
+                    `CORE RULE: Every color must be emotionally and culturally accurate to the mood and the artists. Do NOT use arbitrary or aesthetic-only colors. Research what colors this mood means in this culture:\n` +
+                    `- romantic (Indian/Bollywood) → deep crimson/sindoor red. NOT pink, NOT purple.\n` +
+                    `- romantic (Western) → rose red or wine red. NOT pink.\n` +
+                    `- devotional (Hindu/Sikh) → saffron orange, marigold yellow.\n` +
+                    `- devotional (Islamic/Sufi) → deep forest green, emerald.\n` +
+                    `- party (Punjabi/Bhangra) → electric fuchsia, vibrant magenta.\n` +
+                    `- party (Bollywood) → gold, deep amber.\n` +
+                    `- party (Western/EDM) → neon cyan or electric yellow.\n` +
+                    `- heartbreak → cold steel grey or desaturated blue. Never warm.\n` +
+                    `- sad → deep indigo or midnight blue.\n` +
+                    `- energetic → fiery orange-red or electric orange.\n` +
+                    `- chill → cool cyan, teal, or mint.\n\n` +
+                    `--color-surface must be a very dark (near-black) version of the accent hue. E.g. romantic red accent → #0f0000 surface.\n\n` +
+                    `Return ONLY valid JSON:\n` +
+                    `{\n` +
+                    `  "id": "slug",\n` +
+                    `  "label": "Short Name",\n` +
+                    `  "mood": "${mood}",\n` +
+                    `  "confidence": 0.95,\n` +
+                    `  "description": "one evocative sentence",\n` +
+                    `  "searchTerms": ["term1","term2","term3","term4","term5"],\n` +
+                    `  "theme": {\n` +
+                    `    "cssVars": {\n` +
+                    `      "--color-surface": "#veryDarkHueTintedHex",\n` +
+                    `      "--color-surface-elevated": "rgba(r,g,b,0.08)",\n` +
+                    `      "--color-surface-hover": "rgba(r,g,b,0.15)",\n` +
+                    `      "--color-surface-sidebar": "rgba(r,g,b,0.06)",\n` +
+                    `      "--color-surface-list": "rgba(r,g,b,0.09)",\n` +
+                    `      "--color-accent": "#vividCulturallyAccurateHex",\n` +
+                    `      "--color-accent-hover": "#slightlyBrighterHex",\n` +
+                    `      "--color-text-primary": "#ffffff",\n` +
+                    `      "--color-text-secondary": "#hex warm or cool tinted white",\n` +
+                    `      "--color-text-tertiary": "#hex muted tint",\n` +
+                    `      "--color-border": "rgba(r,g,b,0.2)"\n` +
+                    `    },\n` +
+                    `    "overlayColor": "rgba(r,g,b,0.12)",\n` +
+                    `    "grainOpacity": 0.25,\n` +
+                    `    "vignetteOpacity": 0.5,\n` +
+                    `    "scanlines": false\n` +
+                    `  }\n` +
+                    `}`;
+
+                const fromMoodRes = await fetch("https://api.anthropic.com/v1/messages", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "x-api-key": process.env.ANTHROPIC_API_KEY!,
+                        "anthropic-version": "2023-06-01",
+                    },
+                    body: JSON.stringify({
+                        model: "claude-haiku-4-5-20251001",
+                        max_tokens: 1200,
+                        system: fromMoodPrompt,
+                        messages: [{
+                            role: "user",
+                            content: `Mood: ${mood}. Recent artists: ${(recentArtists ?? []).join(", ") || "unknown"}.`,
+                        }],
+                    }),
+                });
+
+                const fromMoodData = (await fromMoodRes.json()) as any;
+                if (!fromMoodRes.ok || !fromMoodData.content?.[0]) {
+                    return doppelgangerJson({ error: "generation failed" }, 502);
+                }
+
+                try {
+                    const blend = JSON.parse((fromMoodData.content[0].text ?? "").replace(/```json|```/g, "").trim());
+                    // Cache 6 hours — cultural context may vary
+                    await redis.set(cacheKey, JSON.stringify(blend), "EX", 21600);
+                    return doppelgangerJson(blend);
+                } catch {
+                    return doppelgangerJson({ error: "parse failed" }, 502);
+                }
+            }
+
+            // --- Song Mood Detection ---
+
+            if (path === "/api/songs/mood" && method === "POST") {
+                const { trackId, trackName, artistName, albumName } = (await req.json()) as {
+                    trackId?: string;
+                    trackName?: string;
+                    artistName?: string;
+                    albumName?: string;
+                };
+                if (!trackName || !artistName) return json({ error: "trackName and artistName required" }, 400);
+
+                // Cache key: prefer stable trackId, fallback to name hash
+                const cacheKey = `song:mood:${trackId ?? `${trackName.toLowerCase()}::${artistName.toLowerCase()}`}`;
+                const cached = await redis.get(cacheKey);
+                if (cached) return json(JSON.parse(cached), 200, "HIT");
+
+                const moodPrompt =
+                    `You are a music mood classifier. Classify the song and pick a color that emotionally represents this specific song in its cultural context.\n\n` +
+                    `Return ONLY valid JSON — no explanation, no markdown:\n` +
+                    `{ "mood": "<mood>", "emoji": "<single emoji>", "color": "<hex>", "confidence": <0.0-1.0> }\n\n` +
+                    `Mood must be exactly one of:\n` +
+                    `- "romantic"   — love, longing, romance (Tere Bina, Perfect, Tujh Mein Rab Dikhta Hai)\n` +
+                    `- "heartbreak" — loss, separation, grief in love (Someone Like You, Channa Mereya)\n` +
+                    `- "party"      — dance, celebration, high energy (Naatu Naatu, Lean On, Illegal Weapon)\n` +
+                    `- "devotional" — spiritual, sacred, religious (Raghupati Raghava, Dama Dam Mast Qalandar)\n` +
+                    `- "sad"        — sadness, melancholy, not romantic (The Night We Met, Aaj Jaane Ki Zid)\n` +
+                    `- "energetic"  — hype, action, adrenaline (Believer, Zinda, Thunderstruck)\n` +
+                    `- "chill"      — relaxed, introspective, peaceful (lo-fi, acoustic, late night)\n` +
+                    `- "neutral"    — no strong emotional pull\n\n` +
+                    `COLOR RULES — generate a culturally accurate hex for the badge:\n` +
+                    `- romantic: deep red spectrum. Bollywood/Indian romantic → deep crimson (#be123c). Western romantic → rose red (#e11d48). Never pink or purple.\n` +
+                    `- heartbreak: cold desaturated tones. Grey-blue (#64748b) or slate (#475569).\n` +
+                    `- party: bright warm energy. Gold-yellow (#f59e0b) for Bhangra/Bollywood party. Electric yellow (#eab308) for Western/EDM. Avoid white.\n` +
+                    `- devotional: saffron-orange (#f97316) for Hindu/Sikh. Forest green (#16a34a) for Islamic/Sufi. Gold (#ca8a04) for universal devotional.\n` +
+                    `- sad: cool indigo or steel blue. (#6366f1) or (#3b82f6). Never warm colors.\n` +
+                    `- energetic: fiery orange-red (#ef4444) or electric orange (#f97316).\n` +
+                    `- chill: cool cyan or soft teal (#22d3ee) or mint (#4ade80).\n` +
+                    `- neutral: muted grey (#94a3b8).\n\n` +
+                    `Emoji: romantic=💕 heartbreak=💔 party=🎉 devotional=🙏 sad=🌧️ energetic=⚡ chill=🌙 neutral=🎵`;
+
+                const moodRes = await fetch("https://api.anthropic.com/v1/messages", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "x-api-key": process.env.ANTHROPIC_API_KEY!,
+                        "anthropic-version": "2023-06-01",
+                    },
+                    body: JSON.stringify({
+                        model: "claude-haiku-4-5-20251001",
+                        max_tokens: 120,
+                        system: moodPrompt,
+                        messages: [
+                            {
+                                role: "user",
+                                content: `Song: "${trackName}" by ${artistName}${albumName ? ` (album: ${albumName})` : ""}`,
+                            },
+                        ],
+                    }),
+                });
+
+                const moodData = (await moodRes.json()) as any;
+                if (!moodRes.ok || !moodData.content?.[0]) {
+                    return json({ mood: "neutral", emoji: "🎵", confidence: 0 }, 200);
+                }
+
+                try {
+                    const result = JSON.parse((moodData.content[0].text ?? "").replace(/```json|```/g, "").trim());
+                    // Cache for 30 days — a song's mood never changes
+                    await redis.set(cacheKey, JSON.stringify(result), "EX", 2592000);
+                    return json(result, 200, "MISS");
+                } catch {
+                    return json({ mood: "neutral", emoji: "🎵", confidence: 0 }, 200);
+                }
             }
 
             // --- Root ---
